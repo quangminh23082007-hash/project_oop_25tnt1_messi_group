@@ -24,17 +24,21 @@ class RecommendationService:
         model: BaseRecommender,
         evaluator: Optional[Evaluator] = None,
         allow_cold_start_fallback: bool = False,
+        fallback_model: Optional[BaseRecommender] = None,
     ) -> None:
         if model is None or not isinstance(model, BaseRecommender):
             raise InvalidParameterError("model must be an instance of BaseRecommender.")
         if evaluator is not None and not isinstance(evaluator, Evaluator):
             raise InvalidParameterError("evaluator must be an Evaluator or None.")
+        if fallback_model is not None and not isinstance(fallback_model, BaseRecommender):
+            raise InvalidParameterError("fallback_model must be a BaseRecommender instance.")
 
         self._model = model
         self._evaluator = evaluator
         self._allow_cold_start_fallback = allow_cold_start_fallback
+        self._fallback_model = fallback_model
+        self._fallback_dataset: Optional[InteractionDataset] = None
         self._dataset: Optional[InteractionDataset] = None
-        self._fallback_model: Optional[PopularityRecommender] = None
 
     @property
     def is_ready(self) -> bool:
@@ -44,9 +48,31 @@ class RecommendationService:
     def model_name(self) -> str:
         return self._model.name
 
+    @property
+    def allow_cold_start_fallback(self) -> bool:
+        return self._allow_cold_start_fallback
+
+    @allow_cold_start_fallback.setter
+    def allow_cold_start_fallback(self, value: bool) -> None:
+        if not isinstance(value, bool):
+            raise InvalidParameterError("allow_cold_start_fallback must be a boolean.")
+        if value and self._dataset is not None:
+            fallback = self._fallback_model or PopularityRecommender()
+            if not fallback.is_fitted or self._fallback_dataset is not self._dataset:
+                fallback.fit(self._dataset)
+            self._fallback_model = fallback
+            self._fallback_dataset = self._dataset
+        self._allow_cold_start_fallback = value
+
+    @property
+    def dataset(self) -> InteractionDataset:
+        self._ensure_ready()
+        assert self._dataset is not None
+        return self._dataset
+
     def _ensure_ready(self) -> None:
         if self._dataset is None or not self._model.is_fitted:
-            raise ModelNotFittedError("RecommendationService is not trained yet.")
+            raise ModelNotFittedError("Service must be trained before calling operations.")
 
     @staticmethod
     def _validate_non_empty_id(raw_id: str, param_name: str = "raw_id") -> str:
@@ -60,15 +86,15 @@ class RecommendationService:
             raise InvalidParameterError(f"top_k must be a positive integer, got {top_k!r}.")
         return top_k
 
-    def _hydrate_results(self, scored_items: List[ScoredItem]) -> List[RecommendationResult]:
+    def _hydrate_results(self, scored_items: List[ScoredItem], top_k: int) -> List[RecommendationResult]:
         assert self._dataset is not None
         results = []
-        for rank, item in enumerate(scored_items, start=1):
+        for item in scored_items[:top_k]:
             raw_game_id = self._dataset.item_mapper.to_raw(item.item_idx)
             game = self._dataset.get_game_by_raw_id(raw_game_id)
             results.append(
                 RecommendationResult(
-                    rank=rank,
+                    rank=len(results) + 1,
                     game_id=game.item_id,
                     title=game.title,
                     genres=game.genres,
@@ -84,13 +110,24 @@ class RecommendationService:
         if dataset.num_interactions == 0:
             raise EmptyDatasetError("Cannot train on empty dataset.")
 
+        # Atomic commit
         self._model.fit(dataset)
+        new_fallback: Optional[BaseRecommender] = None
         if self._allow_cold_start_fallback:
-            self._fallback_model = PopularityRecommender()
-            self._fallback_model.fit(dataset)
+            new_fallback = self._fallback_model or PopularityRecommender()
+            new_fallback.fit(dataset)
 
         self._dataset = dataset
+        self._fallback_model = new_fallback
+        self._fallback_dataset = dataset if new_fallback is not None else None
         return self
+
+    def swap_model(self, new_model: BaseRecommender, retrain_immediately: bool = True) -> None:
+        if new_model is None or not isinstance(new_model, BaseRecommender):
+            raise InvalidParameterError("new_model must be a BaseRecommender.")
+        if retrain_immediately and self._dataset is not None:
+            new_model.fit(self._dataset)
+        self._model = new_model
 
     def recommend_games(
         self,
@@ -116,7 +153,10 @@ class RecommendationService:
                 raise UnknownUserError(f"User '{clean_user_id}' unknown and fallback disabled.")
             if self._fallback_model is None:
                 self._fallback_model = PopularityRecommender()
+            if not self._fallback_model.is_fitted or self._fallback_dataset is not self._dataset:
                 self._fallback_model.fit(self._dataset)
+                self._fallback_dataset = self._dataset
+
             scored_items = self._fallback_model.recommend(
                 user_idx=0,
                 dataset=self._dataset,
@@ -124,7 +164,7 @@ class RecommendationService:
                 exclude_seen=False,
             )
 
-        return self._hydrate_results(scored_items)
+        return self._hydrate_results(scored_items, valid_k)
 
     def get_user_played_games(self, raw_user_id: str) -> List[GameItem]:
         clean_user_id = self._validate_non_empty_id(raw_user_id, "raw_user_id")
@@ -153,9 +193,10 @@ class RecommendationService:
 
         internal_gt: Dict[int, Set[int]] = {}
         for raw_uid, raw_iids in test_ground_truth.items():
-            if not self._dataset.user_mapper.contains_raw(raw_uid):
+            clean_uid = self._validate_non_empty_id(raw_uid, "test_ground_truth user_id")
+            if not self._dataset.user_mapper.contains_raw(clean_uid):
                 continue
-            u_idx = self._dataset.user_mapper.to_idx(raw_uid)
+            u_idx = self._dataset.user_mapper.to_idx(clean_uid)
             i_idxs = {
                 self._dataset.item_mapper.to_idx(iid)
                 for iid in raw_iids
