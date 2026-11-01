@@ -1,0 +1,24 @@
+{
+  "run_name": "evaluation_demo",
+  "seed": 42,
+  "protocol": {
+    "ks": [3, 5],
+    "positive_threshold": 1.0,
+    "exclude_seen": true,
+    "empty_ground_truth_policy": "skip",
+    "cold_start_policy": "skip"
+  },
+  "data": {
+    "source": "demo",
+    "train_csv": null,
+    "validation_csv": null,
+    "test_csv": null,
+    "num_users": null,
+    "num_items": null
+  },
+  "benchmark": {
+    "include_cornac": false,
+    "split": "test"
+  },
+  "output_dir": "results"
+}
