@@ -3,19 +3,32 @@
 và cung cấp đầy đủ dữ liệu cho thuật toán gợi ý
 
 Nội dung review (văn bản) được nạp riêng từ file CSV.
+
+Nếu CHƯA có file Parquet, hệ thống tự động tạo chúng từ dữ liệu gốc:
+    - games.json
+    - Games_Reviews/<game_id>_<số lượng đánh giá>.csv
+      (trên Kaggle thư mục được giải nén thành Games_Reviews/Games_Reviews)
+rồi lưu lại để các lần chạy sau đọc thẳng từ Parquet.
+
+Cách chạy:
+    Local : python data_layer.py --raw-dir ./data
+    Kaggle: from data_layer import main; dataset = main()
 """
 
+import argparse
 import csv
 import json
 import math
 import os
 import random
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 from scipy.sparse import csr_matrix
 
@@ -354,6 +367,19 @@ class Dataset:
         self._id2game = {idx: gid for gid, idx in self._game2id.items()}
         self._dirty = False
 
+    def validate_mapping(self) -> Dict[str, int]:
+        """Kiểm tra nhanh tính nhất quán giữa dữ liệu tương tác và bảng mapping."""
+        self.build_mapping()
+        game_ids = set(self._games)
+        g_col = self._interaction_data["game_id"]
+        seen_games = set(g_col)
+        return {
+            "Số user đã ánh xạ": len(self._user2id),
+            "Số game đã ánh xạ": len(self._game2id),
+            "Tương tác có game không nằm trong games": sum(1 for g in g_col if g not in game_ids),
+            "Game chưa có tương tác nào": len(game_ids - seen_games),
+        }
+
     def user_index(self, user_id: str) -> int:
         """user_id thực -> chỉ số hàng của ma trận."""
         self.build_mapping()
@@ -496,14 +522,10 @@ class Dataset:
 
 class ParquetDatasetRepository:
     @staticmethod
-    def save(
-        dataset: Dataset,
-        games_path: str = "games.parquet",
-        interactions_path: str = "interactions.parquet",
-    ) -> None:
-        games = list(dataset.games.values())
-
-        games_df = pd.DataFrame(
+    def games_dataframe(games: Iterable[Game]) -> pd.DataFrame:
+        """Chuyển danh sách Game thành DataFrame đúng schema của games.parquet."""
+        games = list(games)
+        return pd.DataFrame(
             {
                 "game_id": [g.game_id for g in games],
                 "name": [g.name for g in games],
@@ -514,6 +536,14 @@ class ParquetDatasetRepository:
                 "tags": [json.dumps(g.tags, ensure_ascii=False) for g in games],
             }
         )
+
+    @staticmethod
+    def save(
+        dataset: Dataset,
+        games_path: str = "games.parquet",
+        interactions_path: str = "interactions.parquet",
+    ) -> None:
+        games_df = ParquetDatasetRepository.games_dataframe(dataset.games.values())
 
         # Chỉ lưu các cột đủ độ dài (cột không có trong dữ liệu gốc sẽ bị bỏ qua).
         # Review không lưu ở đây vì được nạp riêng từ CSV.
@@ -609,6 +639,14 @@ class ParquetDatasetRepository:
         except Exception as e:
             raise DataFormatError(f"Không thể đọc file CSV review: {e}") from e
 
+        # Tự nhận tên cột user: file review có thể dùng "user_id" hoặc "user"
+        if user_col not in header:
+            for alt in ("user_id", "user"):
+                if alt in header:
+                    user_col = alt
+                    wanted = [user_col, game_col, review_col]
+                    break
+
         missing = [c for c in wanted if c not in header]
         if missing:
             raise DataFormatError(
@@ -640,7 +678,418 @@ class ParquetDatasetRepository:
 
 
 # --------------------------------------------------------------------------- #
-# 6. Hàm chạy chính (Tự động quét thư mục Kaggle & Local)
+# 6. Tạo Parquet từ dữ liệu gốc (games.json + Games_Reviews/*.csv)
+# --------------------------------------------------------------------------- #
+
+# Tên file review: <game_id>_<số lượng đánh giá>.csv, ví dụ 730_1523.csv
+_REVIEW_FILE_RE = re.compile(r"^(\d+)_(\d+)\.csv$", re.IGNORECASE)
+
+# Cột trong CSV review (theo file mẫu 251590_49.csv):
+#   user, playtime, post_date, helpfulness, review, recommend, early_access_review
+# - game_id KHÔNG nằm trong CSV mà lấy từ tên file.
+# - user là tên hiển thị (không phải steamid).
+# - playtime tính bằng GIỜ; recommend là "Recommended" / "Not Recommended".
+_REVIEW_COLUMNS: Dict[str, str] = {
+    "user_id": "user",
+    "recommended": "recommend",
+    "playtime": "playtime",
+    "helpfulness": "helpfulness",
+    "review": "review",
+}
+_REQUIRED_REVIEW_COLUMNS = ("user_id", "recommended")
+_RECOMMENDED = "recommended"
+_NOT_RECOMMENDED = "not recommended"
+
+_SKIP_DIRS = {"__pycache__", "node_modules", "site-packages", "venv", "env"}
+
+
+def _to_float(value: object, default: float = 0.0) -> float:
+    try:
+        x = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return default if x != x else x  # x != x: NaN
+
+
+def read_games_json(path: Path) -> Dict[str, Game]:
+    """
+    Đọc games.json -> {game_id: Game}.
+    Cấu trúc: {"<appid>": {"name":..., "price":..., "genres": [...],
+                           "tags": {...}, "positive":..., "negative":..., ...}, ...}
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise DataFormatError(f"Không thể đọc {path}: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise DataFormatError(
+            f"games.json phải là dict khóa theo appid, nhưng đang là {type(raw).__name__}"
+        )
+
+    games: Dict[str, Game] = {}
+    for key, rec in raw.items():
+        gid = _clean_id(key)
+        if not gid or not isinstance(rec, dict):
+            continue
+        games[gid] = Game(
+            game_id=gid,
+            name=rec.get("name") or "",
+            price=_to_float(rec.get("price")),
+            genres=rec.get("genres"),
+            positive=int(_to_float(rec.get("positive"))),
+            negative=int(_to_float(rec.get("negative"))),
+            tags=rec.get("tags"),
+        )
+
+    if not games:
+        raise DataFormatError(f"Không đọc được game nào từ {path}")
+    return games
+
+
+def _resolve_review_columns(header: List[str]) -> Dict[str, str]:
+    """Ánh xạ tên cột logic -> tên cột thực tế; báo lỗi nếu thiếu cột bắt buộc."""
+    present = {h.strip(): h for h in header}
+    missing = [_REVIEW_COLUMNS[k] for k in _REQUIRED_REVIEW_COLUMNS if _REVIEW_COLUMNS[k] not in present]
+    if missing:
+        raise DataFormatError(f"thiếu cột bắt buộc {missing} (các cột hiện có: {header})")
+    return {k: present[v] for k, v in _REVIEW_COLUMNS.items() if v in present}
+
+
+def _numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").fillna(0.0).clip(lower=0.0)
+
+
+class _InteractionWriter:
+    """Ghi interactions.parquet theo từng lô, không giữ toàn bộ dữ liệu trong RAM."""
+
+    SCHEMA = pa.schema(
+        [
+            ("user_id", pa.string()),
+            ("game_id", pa.string()),
+            ("recommended", pa.bool_()),
+            ("playtime", pa.float64()),
+            ("helpfulness", pa.float64()),
+        ]
+    )
+
+    def __init__(self, path: Path, flush_rows: int = 500_000) -> None:
+        self._writer = pq.ParquetWriter(str(path), self.SCHEMA)
+        self._flush_rows = flush_rows
+        self._buf: List[pd.DataFrame] = []
+        self._buf_rows = 0
+        self.rows = 0
+        self.game_ids: Set[str] = set()
+
+    def add(self, df: pd.DataFrame) -> None:
+        if df.empty:
+            return
+        self.game_ids.update(df["game_id"].unique().tolist())
+        self._buf.append(df)
+        self._buf_rows += len(df)
+        self.rows += len(df)
+        if self._buf_rows >= self._flush_rows:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._buf:
+            return
+        df = pd.concat(self._buf, ignore_index=True)
+        self._writer.write_table(pa.Table.from_pandas(df, schema=self.SCHEMA, preserve_index=False))
+        self._buf, self._buf_rows = [], 0
+
+    def close(self) -> None:
+        try:
+            self.flush()
+        finally:
+            self._writer.close()
+
+
+def _scan_raw_data(roots: Iterable[Path]) -> Tuple[Optional[Path], Optional[Path]]:
+    """
+    Quét đệ quy để tìm games.json và thư mục chứa các file <gameid>_<n>.csv.
+    Thư mục review được nhận diện theo nội dung nên tự xử lý được cả trường hợp
+    Games_Reviews/Games_Reviews (Kaggle) lẫn Games_Reviews (local).
+    """
+    games_json: Optional[Path] = None
+    best_dir: Optional[Path] = None
+    best_count = 0
+
+    for root in roots:
+        if not root.exists():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in _SKIP_DIRS]
+            if games_json is None:
+                for f in filenames:
+                    if f.lower() == "games.json":
+                        games_json = Path(dirpath) / f
+                        break
+            n = sum(1 for f in filenames if _REVIEW_FILE_RE.match(f))
+            if n > best_count:
+                best_count, best_dir = n, Path(dirpath)
+
+    return games_json, best_dir
+
+
+def find_raw_data(raw_dir: Optional[Path] = None) -> Tuple[Optional[Path], Optional[Path]]:
+    """
+    Tìm (games.json, thư mục review).
+        - Có raw_dir: chỉ quét trong raw_dir.
+        - Không có: quét /kaggle/input (Kaggle) rồi thư mục hiện tại và thư mục chứa file code (local).
+    """
+    if raw_dir:
+        root = Path(raw_dir)
+        if not root.exists():
+            raise FileNotFoundError(f"Thư mục dữ liệu gốc không tồn tại: {root}")
+        roots = [root]
+    else:
+        roots = [Path("/kaggle/input"), Path.cwd()]
+        try:
+            roots.append(Path(__file__).resolve().parent)
+        except NameError:  # chạy trong notebook, không có __file__
+            pass
+        roots = list(dict.fromkeys(r.resolve() if r.exists() else r for r in roots))
+
+    return _scan_raw_data(roots)
+
+
+def build_parquet_from_raw(
+    output_dir: Path,
+    raw_dir: Optional[Path] = None,
+    games_json: Optional[Path] = None,
+    reviews_dir: Optional[Path] = None,
+    min_reviews_per_game: int = 5,
+    min_interactions_per_user: int = 1,
+    only_games_with_reviews: bool = True,
+    include_reviews: bool = True,
+    chunksize: int = 200_000,
+    verbose: bool = True,
+) -> Tuple[Path, Path]:
+    """
+    Lọc & chuyển dữ liệu gốc thành games.parquet, interactions.parquet (+ reviews.csv).
+
+    Các bước lọc:
+        - Bỏ file review của game không có trong games.json.
+        - Bỏ file có số đánh giá (ghi trong tên file) < min_reviews_per_game.
+        - Bỏ dòng thiếu user_id; mỗi cặp (user, game) chỉ giữ bản ghi đầu tiên.
+        - Bỏ user có ít hơn min_interactions_per_user tương tác (mặc định 1 = không lọc).
+        - Chỉ giữ game có ít nhất 1 tương tác (only_games_with_reviews=True).
+
+    Ghi ra file tạm rồi mới đổi tên, nên nếu bị ngắt giữa chừng sẽ không để lại
+    file Parquet dở dang.
+    """
+    log = print if verbose else (lambda *a, **k: None)
+
+    if games_json is None or reviews_dir is None:
+        found_games, found_reviews = find_raw_data(raw_dir)
+        games_json = games_json or found_games
+        reviews_dir = reviews_dir or found_reviews
+
+    if not games_json or not Path(games_json).is_file():
+        raise FileNotFoundError(
+            "Không tìm thấy games.json. Hãy truyền raw_dir (thư mục chứa games.json) "
+            "hoặc thêm dataset gốc vào Kaggle Input."
+        )
+    if not reviews_dir or not Path(reviews_dir).is_dir():
+        raise FileNotFoundError(
+            "Không tìm thấy thư mục Games_Reviews (chứa các file dạng <gameid>_<số lượng>.csv). "
+            "Hãy truyền raw_dir hoặc thêm dataset gốc vào Kaggle Input."
+        )
+    games_json, reviews_dir = Path(games_json), Path(reviews_dir)
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    games_p, inter_p, rev_p = out / "games.parquet", out / "interactions.parquet", out / "reviews.csv"
+
+    def tmp(p: Path) -> Path:
+        return p.with_name(p.name + ".tmp")
+
+    stage1_p = out / "interactions.stage1.tmp"
+    temp_files = [tmp(games_p), tmp(inter_p), tmp(rev_p), stage1_p]
+
+    log(f"[build] games.json     : {games_json}")
+    log(f"[build] Games_Reviews  : {reviews_dir}")
+    log(f"[build] Thư mục xuất   : {out}")
+
+    games = read_games_json(games_json)
+    log(f"[build] Đọc {len(games):,} game từ games.json")
+
+    # Lập danh sách file review cần xử lý (lọc theo tên file, chưa phải mở file)
+    files: List[Tuple[str, Path]] = []
+    for path in sorted(reviews_dir.iterdir()):
+        m = _REVIEW_FILE_RE.match(path.name)
+        if not m or not path.is_file():
+            continue
+        gid, declared_count = m.group(1), int(m.group(2))
+        if gid in games and declared_count >= min_reviews_per_game:
+            files.append((gid, path))
+    log(f"[build] {len(files):,} file review hợp lệ cần xử lý")
+    if not files:
+        raise DataFormatError(
+            f"Không có file review nào khớp mẫu <gameid>_<số lượng>.csv và game_id có trong games.json "
+            f"(thư mục: {reviews_dir})"
+        )
+
+    second_pass = min_interactions_per_user > 1
+    user_counts: Dict[str, int] = {}
+    skipped = 0
+    bad_rec = 0
+    n_reviews = 0
+    col_cache: Dict[Tuple[str, ...], Dict[str, str]] = {}
+
+    pass1_writer: Optional[_InteractionWriter] = None
+    final_writer: Optional[_InteractionWriter] = None
+    rev_file = None
+    try:
+        pass1_writer = _InteractionWriter(stage1_p if second_pass else tmp(inter_p))
+        if include_reviews:
+            rev_file = open(tmp(rev_p), "w", encoding="utf-8", newline="")
+            rev_writer = csv.writer(rev_file)
+            rev_writer.writerow(["user_id", "game_id", "review"])
+
+        # ---- Pass 1: đọc từng file CSV, chuẩn hóa, ghi ra Parquet ----
+        for n, (gid, path) in enumerate(files, 1):
+            try:
+                header = list(
+                    pd.read_csv(path, nrows=0, encoding="utf-8", encoding_errors="replace").columns
+                )
+                key = tuple(header)
+                if key not in col_cache:
+                    col_cache[key] = _resolve_review_columns(header)
+                cols = col_cache[key]
+                usecols = list(dict.fromkeys(cols.values()))
+                seen: Set[str] = set()
+
+                reader = pd.read_csv(
+                    path,
+                    usecols=usecols,
+                    dtype=str,
+                    na_filter=False,
+                    chunksize=chunksize,
+                    encoding="utf-8",
+                    encoding_errors="replace",
+                )
+                for chunk in reader:
+                    users = chunk[cols["user_id"]].str.strip()
+                    rec_text = chunk[cols["recommended"]].str.strip().str.lower()
+
+                    # Chỉ nhận đúng 2 giá trị "Recommended" / "Not Recommended"
+                    valid_rec = rec_text.isin((_RECOMMENDED, _NOT_RECOMMENDED))
+                    bad_rec += int((~valid_rec & (users != "")).sum())
+
+                    keep = (users != "") & valid_rec & ~users.duplicated(keep="first")
+                    if seen:
+                        keep &= ~users.isin(seen)
+                    chunk, users, rec_text = chunk[keep], users[keep], rec_text[keep]
+                    if chunk.empty:
+                        continue
+                    seen.update(users.tolist())
+
+                    df = pd.DataFrame(
+                        {
+                            "user_id": users,
+                            "game_id": gid,
+                            "recommended": rec_text == _RECOMMENDED,
+                            "playtime": _numeric(chunk[cols["playtime"]])
+                            if "playtime" in cols
+                            else 0.0,
+                            "helpfulness": _numeric(chunk[cols["helpfulness"]])
+                            if "helpfulness" in cols
+                            else 0.0,
+                        }
+                    )
+                    pass1_writer.add(df)
+
+                    if second_pass:
+                        for u in users.tolist():
+                            user_counts[u] = user_counts.get(u, 0) + 1
+
+                    if include_reviews and "review" in cols:
+                        texts = chunk[cols["review"]].str.strip()
+                        has = texts != ""
+                        k = int(has.sum())
+                        if k:
+                            rev_writer.writerows(zip(users[has].tolist(), [gid] * k, texts[has].tolist()))
+                            n_reviews += k
+
+            except Exception as e:  # một file lỗi không làm hỏng cả quá trình
+                skipped += 1
+                log(f"[build] Bỏ qua {path.name}: {e}")
+
+            if verbose and (n % 500 == 0 or n == len(files)):
+                log(f"[build] {n:,}/{len(files):,} file | {pass1_writer.rows:,} tương tác")
+
+        pass1_writer.close()
+        if rev_file:
+            rev_file.close()
+            rev_file = None
+
+        if pass1_writer.rows == 0:
+            raise DataFormatError(
+                f"Không đọc được dòng tương tác nào (bỏ qua {skipped} file). "
+                f"Hãy kiểm tra tên cột CSV so với _REVIEW_COLUMNS."
+            )
+
+        kept_games = pass1_writer.game_ids
+        total_rows = pass1_writer.rows
+
+        # ---- Pass 2 (tùy chọn): lọc user có quá ít tương tác ----
+        if second_pass:
+            valid_users = {u for u, c in user_counts.items() if c >= min_interactions_per_user}
+            user_counts.clear()
+            log(f"[build] Lọc user (>= {min_interactions_per_user} tương tác): giữ {len(valid_users):,} user")
+            final_writer = _InteractionWriter(tmp(inter_p))
+            for batch in pq.ParquetFile(str(stage1_p)).iter_batches(batch_size=500_000):
+                df = batch.to_pandas()
+                final_writer.add(df[df["user_id"].isin(valid_users)])
+            final_writer.close()
+            if final_writer.rows == 0:
+                raise DataFormatError("Không còn tương tác nào sau khi lọc user.")
+            kept_games = final_writer.game_ids
+            total_rows = final_writer.rows
+
+        # ---- games.parquet ----
+        selected = [g for gid, g in games.items() if not only_games_with_reviews or gid in kept_games]
+        ParquetDatasetRepository.games_dataframe(selected).to_parquet(tmp(games_p), index=False)
+
+        # ---- Đổi tên file tạm: games.parquet cuối cùng (làm dấu hiệu đã build xong) ----
+        os.replace(tmp(inter_p), inter_p)
+        if include_reviews:
+            os.replace(tmp(rev_p), rev_p)
+        os.replace(tmp(games_p), games_p)
+
+    except BaseException:
+        if pass1_writer is not None:
+            try:
+                pass1_writer.close()
+            except Exception:
+                pass
+        if final_writer is not None:
+            try:
+                final_writer.close()
+            except Exception:
+                pass
+        if rev_file:
+            rev_file.close()
+        for f in temp_files:
+            f.unlink(missing_ok=True)
+        raise
+    finally:
+        stage1_p.unlink(missing_ok=True)
+
+    log(
+        f"[build] Xong: {len(selected):,} game, {total_rows:,} tương tác, "
+        f"{n_reviews:,} review chữ, bỏ qua {skipped} file lỗi"
+    )
+    if bad_rec:
+        log(f"[build] Cảnh báo: bỏ {bad_rec:,} dòng có cột recommend không phải Recommended/Not Recommended")
+    return games_p, inter_p
+
+
+# --------------------------------------------------------------------------- #
+# 7. Hàm chạy chính (tự quét thư mục Kaggle & Local)
 # --------------------------------------------------------------------------- #
 
 def find_dataset_dir() -> Path:
@@ -649,28 +1098,75 @@ def find_dataset_dir() -> Path:
         Path("/kaggle/input/datasets/synnix/database"),
         Path("/kaggle/input/database"),
         Path("/kaggle/input/Database"),
+        Path("/kaggle/working/processed"),
     ]
     for p in candidates:
         if (p / "games.parquet").is_file() and (p / "interactions.parquet").is_file():
             return p
 
-    search_roots = [Path("/kaggle/input"), Path.cwd()]
+    search_roots = [Path("/kaggle/input"), Path("/kaggle/working"), Path.cwd()]
     for base in search_roots:
         if base.exists():
-            for root, _, files in os.walk(base):
+            for root, dirnames, files in os.walk(base):
+                dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in _SKIP_DIRS]
                 if "games.parquet" in files and "interactions.parquet" in files:
                     return Path(root)
 
     return Path.cwd()
 
 
+def default_output_dir() -> Path:
+    """Kaggle: /kaggle/working/processed (Input chỉ đọc). Local: ./processed."""
+    if Path("/kaggle/working").exists():
+        return Path("/kaggle/working/processed")
+    return Path.cwd() / "processed"
+
+
+def _pick_output_dir(data_dir: Optional[Path], output_dir: Optional[Path]) -> Path:
+    if output_dir:
+        return Path(output_dir)
+    # /kaggle/input là chỉ-đọc nên không thể ghi parquet vào đó
+    if data_dir and not str(data_dir).replace("\\", "/").startswith("/kaggle/input"):
+        return Path(data_dir)
+    return default_output_dir()
+
+
 def main(
     data_dir: Optional[Path] = None,
     reviews_path: Optional[Path] = None,
+    raw_dir: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    rebuild: bool = False,
+    **build_options: object,
 ) -> Dataset:
+    """
+    Nạp dataset. Nếu chưa có file Parquet (hoặc rebuild=True) thì tự tạo từ
+    games.json + Games_Reviews/*.csv rồi mới nạp.
+
+    Tham số:
+        data_dir   : thư mục chứa games.parquet / interactions.parquet (bỏ trống = tự tìm).
+        raw_dir    : thư mục chứa games.json và Games_Reviews (bỏ trống = tự tìm
+                     trong /kaggle/input, thư mục hiện tại).
+        output_dir : nơi lưu Parquet mới tạo (mặc định: Kaggle -> /kaggle/working/processed,
+                     local -> ./processed).
+        rebuild    : True = bỏ qua Parquet cũ và tạo lại từ dữ liệu gốc.
+        build_options: truyền thẳng cho build_parquet_from_raw
+                     (min_reviews_per_game, min_interactions_per_user, ...).
+    """
     target_dir = Path(data_dir) if data_dir else find_dataset_dir()
     games_p = target_dir / "games.parquet"
     inter_p = target_dir / "interactions.parquet"
+
+    if rebuild or not (games_p.is_file() and inter_p.is_file()):
+        out_dir = _pick_output_dir(Path(data_dir) if data_dir else None, output_dir)
+        if rebuild:
+            print("Rebuild: tạo lại Parquet từ dữ liệu gốc...")
+        else:
+            print(f"Chưa có file Parquet tại {target_dir} -> tạo từ dữ liệu gốc...")
+        build_parquet_from_raw(out_dir, raw_dir=raw_dir, **build_options)  # type: ignore[arg-type]
+        target_dir = out_dir
+        games_p = target_dir / "games.parquet"
+        inter_p = target_dir / "interactions.parquet"
 
     # Nếu không truyền đường dẫn, thử tìm reviews.csv cạnh các file parquet
     rev_p = Path(reviews_path) if reviews_path else target_dir / "reviews.csv"
@@ -699,5 +1195,28 @@ def main(
     return dataset
 
 
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Nạp dataset (tự tạo Parquet nếu chưa có).")
+    parser.add_argument("--data-dir", type=Path, help="Thư mục chứa file Parquet")
+    parser.add_argument("--raw-dir", type=Path, help="Thư mục chứa games.json và Games_Reviews")
+    parser.add_argument("--output-dir", type=Path, help="Nơi lưu Parquet mới tạo")
+    parser.add_argument("--reviews-path", type=Path, help="File reviews.csv có sẵn (tùy chọn)")
+    parser.add_argument("--rebuild", action="store_true", help="Tạo lại Parquet từ dữ liệu gốc")
+    parser.add_argument("--min-reviews-per-game", type=int, default=1)
+    parser.add_argument("--min-interactions-per-user", type=int, default=1)
+    # parse_known_args: bỏ qua tham số lạ khi chạy trong notebook/Kaggle
+    args, _ = parser.parse_known_args(argv)
+    return args
+
+
 if __name__ == "__main__":
-    main()
+    _a = _parse_args()
+    main(
+        data_dir=_a.data_dir,
+        reviews_path=_a.reviews_path,
+        raw_dir=_a.raw_dir,
+        output_dir=_a.output_dir,
+        rebuild=_a.rebuild,
+        min_reviews_per_game=_a.min_reviews_per_game,
+        min_interactions_per_user=_a.min_interactions_per_user,
+    )
