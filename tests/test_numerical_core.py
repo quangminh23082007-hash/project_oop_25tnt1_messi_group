@@ -3,9 +3,9 @@ import unittest
 
 import numpy as np
 
-from matrix_factorization import BPRMatrixFactorization, bpr_loss_and_gradients
-from popularity import PopularityRecommender
-from text_bpr import TextBPRMatrixFactorization, text_bpr_loss_and_gradients
+from src.models._array.matrix_factorization import BPRMatrixFactorization, bpr_loss_and_gradients
+from src.models._array.popularity import PopularityRecommender
+from src.models._array.text_bpr import TextBPRMatrixFactorization, text_bpr_loss_and_gradients
 
 
 class ModelTests(unittest.TestCase):

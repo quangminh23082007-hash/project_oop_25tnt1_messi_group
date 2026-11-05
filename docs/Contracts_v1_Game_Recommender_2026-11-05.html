@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Contracts v1 cho đồ án OOP hệ thống đề xuất game, có yêu cầu bàn giao review text và train-only text features.">
+<title>Contracts v1 cho hệ thống đề xuất game</title>
+<style>
+:root{color-scheme:light}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:#fff;color:#222b33;font:17px/1.65 "Segoe UI",Arial,sans-serif}
+main{max-width:1080px;margin:0 auto;padding:48px 42px 64px}
+h1,h2,h3{color:#111;line-height:1.3}
+h1{font-size:36px;margin:14px 0 20px}
+h2{font-size:26px;margin:0 0 22px}
+h3{font-size:19px;margin:28px 0 10px}
+p{margin:12px 0}
+.eyebrow{font-size:14px;color:#53616c}
+.lead{font-size:19px}
+.status{color:#5d4b29;font-size:15px}
+nav{display:grid;grid-template-columns:1fr 1fr;gap:9px 24px;padding:24px 0;margin:30px 0 44px;border-top:1px solid #d9dfe3;border-bottom:1px solid #d9dfe3}
+a{color:#155a95;text-underline-offset:3px;overflow-wrap:anywhere}
+section{margin:0 0 52px;scroll-margin-top:22px}
+.table-wrap{overflow-x:auto;margin:20px 0}
+table{border-collapse:collapse;width:100%;font-size:15px;line-height:1.5}
+th,td{border:1px solid #d5dce0;text-align:left;vertical-align:top;padding:12px 14px}
+th{background:#e9f0f5;color:#172b3a}
+tbody tr:nth-child(even){background:#fafbfd}
+code{font:0.89em/1.5 Consolas,"Courier New",monospace;background:#f2f5f7;padding:1px 4px;border-radius:3px;overflow-wrap:anywhere}
+pre{font-size:15px;line-height:1.55;background:#f6f8fa;border:1px solid #e1e6ea;border-radius:5px;padding:16px 18px;overflow-x:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+pre code{background:none;padding:0;font:inherit}
+ul,ol{padding-left:26px}
+li{margin:8px 0}
+footer{border-top:1px solid #d9dfe3;padding-top:22px;font-size:14px;color:#56636d}
+@media(max-width:650px){main{padding:25px 18px}body{font-size:16px}h1{font-size:29px}h2{font-size:23px}nav{grid-template-columns:1fr}table{font-size:13px}th,td{padding:9px 8px}pre{font-size:13px;padding:12px}}
+@media print{body{font:11pt/1.5 "Segoe UI",Arial,sans-serif}main{max-width:none;padding:0}h1{font-size:24pt}h2{font-size:18pt}h3{font-size:13pt}nav{display:none}section{margin-bottom:24pt}h2,h3{break-after:avoid}thead{display:table-header-group}tr{break-inside:avoid}table{font-size:9pt}.table-wrap{overflow:visible}pre{font-size:9pt;white-space:pre-wrap}a{color:#174d78}footer{font-size:9pt}}
+</style>
+</head>
+<body><main>
+<header>
+<p class="eyebrow">Đồ án OOP · Hệ thống đề xuất game · 05/11/2026</p>
+<h1>Contracts v1 cho hệ thống đề xuất game</h1>
+<p class="status"><strong>Trạng thái:</strong> Bản thiết kế mục tiêu để cả bốn thành viên xác nhận. Bản này đã bổ sung yêu cầu review text rõ ràng trong Data. Chưa tự động áp dụng thay đổi vào code.</p>
+<p class="lead">Bốn phần dùng chung kiểu dữ liệu, giao diện và protocol. Giữ lõi thuật toán và metric đã viết; dùng adapter để kết nối qua contracts chung.</p>
+<p><strong>Data bắt buộc bàn giao review text có sẵn từ nguồn, gắn đúng user–game và split, kèm thống kê text thiếu. TextBPR chỉ dùng text train.</strong> Không bắt buộc mọi interaction đều có text và không được tạo review thay thế cho dòng thiếu.</p>
+<p>Yêu cầu chi tiết nằm tại <a href="#review-handoff">Bàn giao review text bắt buộc</a>. Có thể đọc file này offline hoặc dùng chức năng In của trình duyệt để lưu PDF.</p>
+</header>
+<nav aria-label="Mục lục"><a href="#scope">1. Phạm vi và nguyên tắc chung</a><a href="#ids">2. Quy ước ID, nhãn và thời gian</a><a href="#types">3. Các kiểu dữ liệu chung</a><a href="#data">4. Contract của Data</a><a href="#model">5. Contract của Model</a><a href="#evaluation">6. Contract của Evaluation và Benchmark</a><a href="#service">7. Contract của Service</a><a href="#errors">8. Ngoại lệ chung</a><a href="#ownership">9. Vị trí định nghĩa và phân công</a><a href="#acceptance">10. Tiêu chí xác nhận triển khai</a></nav>
+<section id="scope"><h2>1. Phạm vi và nguyên tắc chung</h2>
+<div class="table-wrap"><table><thead><tr><th>Phần</th><th>Trách nhiệm</th></tr></thead><tbody><tr><td>Data</td><td>Đọc, làm sạch, chia dữ liệu, tạo mapping, bàn giao catalog, lịch sử và <strong>review text</strong>.</td></tr><tr><td>Model</td><td>Huấn luyện và tính điểm phù hợp giữa user với game; cung cấp public adapter theo giao diện chung.</td></tr><tr><td>Service</td><td>Điều phối train/recommend/evaluate, xử lý ID gốc, lọc và fallback.</td></tr><tr><td>Evaluation và Benchmark</td><td>Tính metric, áp dụng protocol đánh giá, so sánh model và xuất báo cáo.</td></tr></tbody></table></div>
+<p>Các lớp dữ liệu và giao diện dùng chung được định nghĩa tại <code>src/contracts</code>. Những phần khác import hoặc re-export các lớp này; không tự tạo một lớp tương đương có cùng tên nhưng khác kiểu.</p>
+<p>Chỉ có một <code>BaseRecommender</code> công khai ở ranh giới giữa các phần. Lõi thuật toán hiện có có thể giữ giao diện nội bộ riêng và được bọc bằng adapter.</p>
+<p><strong>Yêu cầu review text:</strong> Data phải bàn giao text có sẵn từ nguồn, gắn đúng user–game và split, kèm thống kê text thiếu. Đây là đầu ra bắt buộc của Data. TextBPR chỉ sử dụng phần text thuộc train.</p>
+<p>V1 là bản thiết kế mục tiêu để bốn thành viên xác nhận và triển khai. Tài liệu không khẳng định code hiện tại đã đáp ứng toàn bộ giao diện này.</p></section>
+<section id="ids"><h2>2. Quy ước ID, nhãn và thời gian</h2>
+<div class="table-wrap"><table><thead><tr><th>Loại</th><th>Kiểu</th><th>Ví dụ</th><th>Nơi sử dụng</th></tr></thead><tbody><tr><td>ID user gốc</td><td><code>str</code></td><td><code>"steam_user_123"</code></td><td>File dữ liệu, tra cứu, giao diện người dùng</td></tr><tr><td>ID game gốc</td><td><code>str</code></td><td><code>"570"</code></td><td>Catalog, tra cứu, giao diện người dùng</td></tr><tr><td>ID user nội bộ</td><td><code>int</code></td><td><code>0</code></td><td>Model, Evaluation</td></tr><tr><td>ID game nội bộ</td><td><code>int</code></td><td><code>12</code></td><td>Model, Evaluation</td></tr></tbody></table></div>
+<p>ID nội bộ bắt đầu từ 0, liên tục và nằm trong dimensions đã khai báo. ID gốc được chuẩn hóa khoảng trắng; không tự đổi chữ hoa/thường hoặc thay đổi nội dung ID. Data phải xác minh nguồn user ID có thể phân biệt các tài khoản; tên hiển thị không mặc nhiên là ID duy nhất.</p>
+<h3>Nhãn đánh giá</h3>
+<ul><li><code>rating = 1.0</code>: review tích cực.</li><li><code>rating = 0.0</code>: review tiêu cực.</li><li>Không có interaction: chưa biết ý kiến của user.</li></ul>
+<p><code>rating</code> không chứa Wilson score, weighted score hoặc score dự đoán của Model. Cột nguồn như <code>recommended</code> được Data chuyển rõ ràng về nhãn 0/1.</p>
+<p>Score của Model là số thực hữu hạn dùng để xếp hạng. Score lớn hơn được xếp trước; không bắt buộc nằm trong khoảng 0–1 hoặc 1–5.</p>
+<h3>Thời gian và text</h3>
+<p><code>timestamp</code> dùng Unix timestamp theo mili giây UTC. Giá trị 0 biểu thị chưa có thời gian đáng tin cậy. Không dùng dữ liệu thiếu timestamp để tuyên bố đã đánh giá theo thời gian.</p>
+<p>Text dùng UTF-8, giữ Unicode và nội dung nguồn. CSV phải quote đúng dấu phẩy, dấu nháy và xuống dòng; JSONL phải escape xuống dòng đúng chuẩn. Data không tự dịch, sinh text thay thế hoặc suy ra nhãn mới từ nội dung text.</p></section>
+<section id="types"><h2>3. Các kiểu dữ liệu chung</h2>
+<h3>InteractionRecord — bản ghi trước mapping</h3>
+<div class="table-wrap"><table><thead><tr><th>Trường</th><th>Kiểu và ý nghĩa</th></tr></thead><tbody><tr><td><code>user_id</code></td><td><code>str</code>, ID user gốc</td></tr><tr><td><code>item_id</code></td><td><code>str</code>, ID game gốc</td></tr><tr><td><code>rating</code></td><td><code>float</code>, chỉ 0.0 hoặc 1.0</td></tr><tr><td><code>timestamp</code></td><td><code>int</code>, mặc định 0</td></tr><tr><td><code>text</code></td><td><code>str | None</code>, review text từ nguồn; <code>None</code> nếu thiếu</td></tr></tbody></table></div>
+<p>Trường <code>text</code> phải có trong schema và luồng xử lý. Không bắt buộc mọi interaction đều có text. Cột nguồn <code>review</code> hoặc tên tương đương được chuyển thành <code>text</code> ở đầu ra chung.</p>
+<h3>Interaction — bản ghi sau mapping</h3>
+<div class="table-wrap"><table><thead><tr><th>Trường</th><th>Kiểu</th></tr></thead><tbody><tr><td><code>user_id</code></td><td><code>int</code> nội bộ</td></tr><tr><td><code>item_id</code></td><td><code>int</code> nội bộ</td></tr><tr><td><code>rating</code></td><td><code>float</code>, chỉ 0.0 hoặc 1.0</td></tr><tr><td><code>timestamp</code></td><td><code>int</code>, mặc định 0</td></tr></tbody></table></div>
+<p>Interaction dùng thống nhất trong Data, Model adapter và Evaluation. Có thể lưu text riêng để tránh nhân đôi chuỗi review trong mọi cấu trúc tương tác.</p>
+<h3>ReviewRecord — review sau mapping</h3>
+<div class="table-wrap"><table><thead><tr><th>Trường</th><th>Kiểu và yêu cầu</th></tr></thead><tbody><tr><td><code>user_id</code></td><td><code>int</code> nội bộ</td></tr><tr><td><code>item_id</code></td><td><code>int</code> nội bộ</td></tr><tr><td><code>rating</code></td><td><code>float</code>, phải khớp Interaction tương ứng</td></tr><tr><td><code>timestamp</code></td><td><code>int</code>, phải khớp Interaction tương ứng</td></tr><tr><td><code>text</code></td><td><code>str</code> không rỗng sau khi kiểm tra text thiếu/trống</td></tr></tbody></table></div>
+<p>Mỗi ReviewRecord phải thuộc đúng cặp user–game của Dataset chứa nó. Nhãn, timestamp và text phải lấy từ cùng bản ghi được giữ sau dedup; không ghép nhãn của bản ghi này với text cập nhật của bản ghi khác.</p>
+<h3>GameItem</h3>
+<div class="table-wrap"><table><thead><tr><th>Trường</th><th>Kiểu và ý nghĩa</th></tr></thead><tbody><tr><td><code>item_id</code></td><td><code>str</code>, ID game gốc</td></tr><tr><td><code>title</code></td><td><code>str</code>, tên game</td></tr><tr><td><code>genres</code></td><td><code>tuple[str, ...]</code></td></tr><tr><td><code>price</code></td><td><code>float</code> không âm hoặc <code>None</code> nếu không rõ</td></tr><tr><td><code>developer</code></td><td><code>str</code>, mặc định <code>"Unknown"</code></td></tr></tbody></table></div>
+<p>Giá phải cùng đơn vị tiền tệ trong một catalog; đơn vị ghi trong metadata. Giá không rõ không được tự coi là miễn phí. Khi lọc theo giá tối đa, game chưa rõ giá bị loại khỏi kết quả lọc. Data chuyển các tên nguồn như <code>game_id/name</code> sang <code>item_id/title</code> tại đầu ra chung.</p>
+<h3>ScoredItem và RecommendationResult</h3>
+<p>ScoredItem dùng cho kết quả xếp hạng nội bộ:</p>
+<pre><code>item_idx: int
+score: float</code></pre>
+<p>RecommendationResult trả cho người dùng:</p>
+<pre><code>rank: int
+game_id: str
+title: str
+genres: tuple[str, ...]
+predicted_score: float
+price: float | None
+developer: str
+model_name: str
+is_fallback: bool</code></pre>
+<p><code>game_id</code> là ID gốc. Làm tròn score để hiển thị không được làm thay đổi thứ tự đã chọn.</p></section>
+<section id="data"><h2>4. Contract của Data</h2>
+<h3>IdMapper</h3>
+<pre><code>size
+contains_raw(raw_id) -&gt; bool
+to_idx(raw_id) -&gt; int
+to_raw(index) -&gt; str</code></pre>
+<p>Mapping được tạo từ toàn bộ tương tác train, gồm tích cực và tiêu cực, sau đó đóng băng. Validation/test không được tạo mapping riêng hoặc tự mở rộng mapping train.</p>
+<h3>InteractionDataset</h3>
+<p>Thuộc tính bắt buộc:</p>
+<pre><code>split_name
+interactions
+num_interactions
+num_users
+num_items
+user_mapper
+item_mapper
+mapping_fingerprint
+fingerprint
+review_fingerprint</code></pre>
+<ul>
+<li><code>split_name</code> nhận train, validation hoặc test.</li>
+<li><code>interactions</code> chứa Interaction của đúng split đó.</li>
+<li>Dimensions lấy từ mapping chung.</li>
+<li><code>mapping_fingerprint</code> nhận diện mapping; <code>fingerprint</code> nhận diện nội dung tương tác của split cùng mapping.</li>
+<li><code>review_fingerprint</code> nhận diện cả nội dung text, cặp user–game, nhãn và timestamp của review thuộc split. Thay đổi text phải làm thay đổi fingerprint này.</li>
+</ul>
+<p>Phương thức bắt buộc:</p>
+<pre><code>get_game_by_raw_id(raw_game_id) -&gt; GameItem
+get_user_seen_items(user_id) -&gt; frozenset[int]
+get_user_positive_items(user_id) -&gt; frozenset[int]
+iter_reviews() -&gt; Iterable[ReviewRecord]</code></pre>
+<p><code>get_user_seen_items()</code> gồm mọi tương tác trong Dataset, cả positive và negative. <code>iter_reviews()</code> chỉ trả text không rỗng, đúng cặp và đúng split của Dataset đó; text thiếu/trống được đếm trong report. <strong>train.iter_reviews() không được trả review validation/test.</strong></p>
+<p>Bản ghi và mapping được cung cấp theo cách chỉ đọc, không được sửa sau khi model đã sử dụng. Có thể đọc review theo luồng; không bắt buộc đưa toàn bộ text vào RAM.</p>
+<h3>DatasetSplits và cổng chuẩn bị dữ liệu</h3>
+<pre><code>DatasetSplits:
+    train: InteractionDataset
+    validation: InteractionDataset
+    test: InteractionDataset
+    report: thông tin chuẩn bị dữ liệu</code></pre>
+<p>Ba Dataset dùng cùng mapping đã fit từ train, có nội dung tương tác và fingerprints riêng.</p>
+<pre><code>DataPipeline.prepare(
+    games_path,
+    interactions_path,
+    *,
+    reviews_path=None,
+    split_config=None
+) -&gt; DatasetSplits</code></pre>
+<p><code>reviews_path=None</code> chỉ dùng khi text đã có trong nguồn interactions hoặc Data có thể tìm được artifact text được khai báo rõ. Không có nghĩa là được bỏ qua text. Nếu bộ nguồn không có review text, Data phải báo rõ chưa đáp ứng bộ bàn giao để chạy TextBPR.</p>
+<h3>Protocol chia dữ liệu mặc định</h3>
+<p>V1 dùng per-user random split, seed 42, định hướng 80%/10%/10%. Sau clean và dedup, user có n ≥ 3 tương tác được chia:</p>
+<pre><code>validation_count = max(1, floor(0.1 × n))
+test_count       = max(1, floor(0.1 × n))
+train_count      = phần còn lại</code></pre>
+<p>User dưới ba tương tác được đưa toàn bộ vào train và ghi số lượng trong report. Sắp thứ tự đầu vào xác định trước khi random để kết quả không phụ thuộc chunksize. Đây là held-out preference evaluation, không phải temporal evaluation.</p>
+<h3>Làm sạch và dữ liệu ngoài mapping</h3>
+<ul>
+<li>Loại dòng sai trước dedup. Mỗi cặp giữ bản ghi hợp lệ đầu tiên theo thứ tự file/dòng xác định.</li>
+<li>Giữ đúng text của bản ghi đã chọn; ghi số duplicate và số cặp có nhãn mâu thuẫn.</li>
+<li>Một cặp không được xuất hiện ở nhiều split.</li>
+<li>ID ngoài mapping không được gán −1 hoặc thêm vào mapping.</li>
+<li>Nếu một user có positive của split nằm ngoài catalog train, loại user đó khỏi phép chấm của split và ghi nhận. Dòng negative ngoài mapping được bỏ và đếm riêng.</li>
+<li>Không âm thầm xóa positive ngoài catalog rồi tính Recall trên phần đáp án nhỏ hơn.</li>
+</ul>
+<p>Report ghi số dòng/user/item bị loại, lý do, số lượng từng split, seed và fingerprints. Các con số về dòng và user phải được phân biệt, không cộng lẫn thành một tổng.</p>
+<h3 id="review-handoff">Bàn giao review text bắt buộc</h3>
+<p><strong>Data phải bàn giao text có sẵn từ nguồn, không chỉ tổng số review tích cực/tiêu cực và không chỉ ma trận interaction.</strong> Mỗi record được bàn giao phải có khả năng đối chiếu đúng user, game, nhãn và split.</p>
+<div class="table-wrap"><table><thead><tr><th>Artifact</th><th>Schema / phạm vi</th><th>Yêu cầu</th></tr></thead><tbody><tr><td><code>reviews.csv</code></td><td><code>user_id,item_id,rating,timestamp,text,split</code>; user/item là ID gốc.</td><td>Một dòng cho mỗi interaction được bàn giao sau clean/dedup và chính sách loại unknown. Text thiếu để ô rỗng; split là train/validation/test.</td></tr><tr><td><code>train_reviews.jsonl</code></td><td><code>user_id,item_id,rating,timestamp,text</code>; user/item là ID nội bộ.</td><td>Chỉ review không rỗng, đúng cặp thuộc train. Đây là nguồn text chuẩn để tạo features TextBPR.</td></tr><tr><td><code>validation_reviews.jsonl</code></td><td>Cùng schema mapped như train_reviews.</td><td>Chỉ review không rỗng của validation; không dùng tạo features train.</td></tr><tr><td><code>test_reviews.jsonl</code></td><td>Cùng schema mapped như train_reviews.</td><td>Chỉ review không rỗng của test; không dùng train hoặc chọn cấu hình.</td></tr><tr><td>Mapping và report đi kèm</td><td>Ánh xạ hai chiều, fingerprints, thống kê text.</td><td>Đủ đối chiếu raw/mapped IDs, số text thiếu/trống/bị loại và số review từng split.</td></tr></tbody></table></div>
+<p>Tên file trên là tên đầu ra thống nhất của v1. Các artifact phải mô tả cùng bộ record sau lọc với Dataset tương ứng; không để file review chứa thêm record ngoài phạm vi Dataset mà không có giải thích trong report.</p>
+<p>JSONL có một đối tượng JSON trên mỗi dòng. Ví dụ minh họa một dòng trong train_reviews.jsonl:</p>
+<pre><code>{&quot;user_id&quot;:0,&quot;item_id&quot;:1,&quot;rating&quot;:1,&quot;timestamp&quot;:0,&quot;text&quot;:&quot;Chơi cùng bạn bè rất vui.&quot;}</code></pre>
+<p>Report tối thiểu thêm: số interaction có text, thiếu/trống text, số review theo từng split, text bị loại do clean/dedup/mapping, số item train có review và checksum của từng artifact text.</p>
+<p>Không nối cả ba file JSONL để tạo features. Nếu không có text train hợp lệ, phải báo rõ không đủ điều kiện chạy TextBPR; Popularity/BPR có thể tiếp tục chạy theo cấu hình tương ứng.</p></section>
+<section id="model"><h2>5. Contract của Model</h2>
+<h3>Giao diện công khai</h3>
+<p>Mọi public model và adapter benchmark đáp ứng BaseRecommender chung.</p>
+<pre><code>name
+is_fitted
+num_users
+num_items
+mapping_fingerprint
+train_fingerprint</code></pre>
+<pre><code>fit(
+    train_dataset,
+    *,
+    validation_score=None,
+    item_features=None,
+    verbose=False
+) -&gt; self
+
+score_items(user_id, item_ids) -&gt; Sequence[float]
+
+recommend(
+    user_id,
+    train_dataset,
+    top_k=10,
+    exclude_seen=True
+) -&gt; list[ScoredItem]
+
+config() -&gt; dict</code></pre>
+<p><code>fit()</code> chỉ nhận Dataset có split_name là train. Adapter chuyển train thành positive_pairs (rating 1.0) và observed_pairs (mọi cặp train, cả negative), dạng integer shape (N, 2).</p>
+<ul>
+<li>Popularity đếm positive train.</li>
+<li>BPR/TextBPR học từ positive train; observed train chặn negative sampling.</li>
+<li>Validation/test không được đưa vào hai mảng train.</li>
+<li>Không có positive train hoặc không tạo được BPR triple hợp lệ thì báo lỗi rõ ràng, không lặp vô hạn.</li>
+</ul>
+<h3>Scoring và recommendation</h3>
+<p><code>score_items()</code> nhận ID nội bộ; trả đúng số score và thứ tự ứng viên; không tự lọc lịch sử, sắp lại ứng viên hay fallback. Từ chối sai shape, NaN, Infinity hoặc kiểu không hợp lệ. Danh sách ứng viên rỗng trả [].</p>
+<p><code>recommend()</code> là helper chung: lấy item trong mapping train → lọc mọi lịch sử khi được yêu cầu → gọi scoring → sort score giảm dần, hòa điểm theo item ID tăng dần → trả tối đa K item không lặp. Service quyết định tùy chọn lọc; các thuật toán không tự áp dụng quy tắc xếp hạng khác nhau.</p>
+<h3>Trạng thái train và callback</h3>
+<p><code>validation_score(candidate)</code> trả số thực hữu hạn cần tối đa hóa. Candidate là model công khai có thể scoring, có dimensions và fingerprints đúng; Evaluator chấm được checkpoint của epoch hiện tại.</p>
+<p>Model chịu trách nhiệm early stopping, giữ/phục hồi checkpoint tốt nhất và chỉ hoàn tất fit sau phục hồi. Train/callback thất bại phải vô hiệu hóa model; không tiếp tục báo sẵn sàng chỉ vì backend còn cờ fitted. Popularity không dùng early-stopping callback và phải báo cấu hình không hỗ trợ nếu nhận callback.</p>
+<h3>Cấu hình</h3>
+<p><code>config()</code> trả cấu hình thực tế ghi được JSON. Giữ tên trường chung ModelConfig; adapter đổi sang tên backend:</p>
+<div class="table-wrap"><table><thead><tr><th>Tên chung</th><th>Backend hiện tại</th></tr></thead><tbody><tr><td><code>n_factors</code></td><td><code>factors</code></td></tr><tr><td><code>n_epochs</code></td><td><code>epochs</code></td></tr><tr><td><code>random_seed</code></td><td><code>seed</code></td></tr></tbody></table></div>
+<p>Learning rate, regularization, patience và text regularization được ghi khi áp dụng. Tham số không được hỗ trợ phải báo lỗi.</p>
+<h3>ItemFeatures của TextBPR</h3>
+<pre><code>values
+item_ids
+mapping_fingerprint
+train_fingerprint
+text_fingerprint
+encoder_name</code></pre>
+<ul>
+<li>Ma trận shape (num_items, embedding_dimension), giá trị hữu hạn; vector norm 1 hoặc zero khi item thiếu text.</li>
+<li>Mỗi hàng đúng item theo mapping; metadata phải đối chiếu được thứ tự item_ids.</li>
+<li>Chỉ dùng review từ train.iter_reviews() hoặc train_reviews.jsonl. Có thể dùng text của cả review positive và negative trong train.</li>
+<li>Mapping/train fingerprints phải khớp Dataset đang fit. text_fingerprint khớp review_fingerprint của train.</li>
+<li>Không học encoder/vocabulary/IDF hoặc tổng hợp features từ review validation/test. Encoder pretrained cố định được khai báo tên/phiên bản.</li>
+<li>Báo số review được dùng, số item có text và số vector zero. Shape đúng chưa đủ chứng minh nguồn text/mapping đúng.</li>
+</ul></section>
+<section id="evaluation"><h2>6. Contract của Evaluation và Benchmark</h2>
+<h3>Giao diện đánh giá công khai</h3>
+<pre><code>BaseEvaluator.evaluate(
+    model,
+    train_dataset,
+    evaluation_dataset,
+    *,
+    additional_seen_dataset=None
+) -&gt; EvaluationResult</code></pre>
+<ul>
+<li>Train Dataset phải có vai trò train; evaluation Dataset là validation hoặc test.</li>
+<li>Dimensions/mapping fingerprints phải khớp. Model được train trên đúng train fingerprint; so sánh nội dung fingerprints, không so sánh identity object Python.</li>
+<li>Không có cặp trùng giữa các Dataset tham gia.</li>
+<li>Additional seen mặc định None; nếu cung cấp, chỉ được là validation khi chấm test. Nó chỉ bổ sung lịch sử lọc, không thay train hoặc profile đã học.</li>
+</ul>
+<p>Đây là public API mới của v1. Có thể giữ lõi Evaluator hiện tại bên trong bằng cách lấy interactions và dimensions từ Dataset; không cần viết lại công thức metric.</p>
+<h3>Protocol mặc định</h3>
+<ul>
+<li>Relevant là rating 1.0; lịch sử lọc gồm mọi train interaction, cả negative.</li>
+<li>Candidates là mọi item thuộc mapping train trừ lịch sử đã biết. Không loại item chỉ vì nó xuất hiện trong test.</li>
+<li>Cùng tập user/candidates cho mọi model. User phải có ít nhất một positive train; user không có positive ground truth của split được bỏ qua.</li>
+<li>Ghi lý do/số user bị bỏ qua. Mapping exclusions do Data được báo riêng với skips trong Evaluator.</li>
+<li>Sort score giảm dần, hòa điểm theo item ID tăng dần.</li>
+<li>Metric chính Recall/NDCG tại K = 5, 10; mục tiêu chọn epoch mặc định NDCG@10.</li>
+</ul>
+<p>Demo có thể giữ K = 3, 5 để phục vụ ví dụ, nhưng phải ghi rõ cấu hình. Danh sách đề xuất ngắn hợp lệ; IDCG của NDCG dựa trên min(K, số relevant), không dựa trên độ dài danh sách trả về.</p>
+<h3>Một kiểu kết quả công khai</h3>
+<p>Dùng EvaluationResult. Service không tiếp tục yêu cầu EvaluationReport khác.</p>
+<pre><code>EvaluationResult:
+    model_name
+    split_name
+    metrics
+    per_user
+    skipped_users
+    fit_seconds
+    evaluate_seconds
+
+UserEvaluation:
+    user_id
+    metrics
+    recommended_items
+    relevant_items
+    candidate_count
+
+SkippedUser:
+    user_id
+    reason</code></pre>
+<p>Đếm evaluated/skipped users và tổng theo lý do từ các bản ghi trên. Không trộn số record bị Data loại với số user được Evaluator bỏ qua.</p>
+<h3>Benchmark</h3>
+<ol>
+<li>Nhận DatasetSplits và khởi tạo model theo cấu hình.</li>
+<li>Tạo callback chấm validation và fit trên train.</li>
+<li>Chấm checkpoint đã chọn trên test.</li>
+<li>Xuất summary.csv, per_user.csv, run_config.json.</li>
+</ol>
+<p>V1 không tự refit train + validation. Test không dùng chọn epoch/siêu tham số. Metadata ghi protocol, model config, seed, thư viện, fingerprints, Data report, thống kê/checksum review text và feature metadata nếu có.</p></section>
+<section id="service"><h2>7. Contract của Service</h2>
+<p>Service nhận model theo BaseRecommender và evaluator theo BaseEvaluator.</p>
+<pre><code>train(
+    train_dataset,
+    *,
+    validation_score=None,
+    item_features=None
+) -&gt; self
+
+recommend_games(
+    raw_user_id,
+    top_k=10,
+    exclude_played=True,
+    genre_filter=None,
+    max_price=None
+) -&gt; list[RecommendationResult]
+
+get_user_played_games(raw_user_id) -&gt; list[GameItem]
+get_game_details(raw_game_id) -&gt; GameItem
+
+evaluate_model(
+    evaluation_dataset,
+    *,
+    additional_seen_dataset=None
+) -&gt; EvaluationResult</code></pre>
+<p>Service lưu train Dataset sau khi train thành công và truyền đúng Dataset đó vào Evaluator.</p>
+<h3>Fallback</h3>
+<ul>
+<li>Mặc định không bật fallback.</li>
+<li>User không thuộc mapping hoặc chưa có positive train không được giả vờ là user có profile.</li>
+<li>Khi bật fallback, chỉ dùng model toàn cục như Popularity. Nó cung cấp score_global(item_ids) và train trên cùng train Dataset.</li>
+<li>BPR/TextBPR không được cấu hình làm fallback toàn cục.</li>
+<li>Kết quả ghi is_fallback=True. Không tự mượn user 0 để tạo đề xuất cá nhân hóa cho user lạ.</li>
+</ul>
+<h3>Lọc và trạng thái</h3>
+<p>Mặc định loại game đã review positive lẫn negative. Lọc giá/thể loại cố gắng lấy đủ K nếu còn đủ game hợp lệ; không còn game thì trả []. Train primary/fallback thất bại không được để Service báo sẵn sàng với model/dataset lệch nhau.</p>
+<p>Benchmark có thể gọi Model và Evaluator trực tiếp theo cùng contracts, không bắt buộc qua Service.</p></section>
+<section id="errors"><h2>8. Ngoại lệ chung</h2>
+<p>Ngoại lệ nghiệp vụ lấy từ src/contracts/exceptions.py.</p>
+<div class="table-wrap"><table><thead><tr><th>Ngoại lệ</th><th>Trường hợp</th></tr></thead><tbody><tr><td><code>DataValidationError</code></td><td>Dữ liệu, mapping, vector hoặc score không hợp lệ</td></tr><tr><td><code>EmptyDatasetError</code></td><td>Không có dữ liệu hoặc không còn user đủ điều kiện</td></tr><tr><td><code>ConfigurationError</code></td><td>Siêu tham số, features hoặc cấu hình không phù hợp</td></tr><tr><td><code>ModelNotFittedError</code></td><td>Scoring/recommend trước khi train thành công</td></tr><tr><td><code>UnknownUserError</code></td><td>Không tìm thấy raw user ID</td></tr><tr><td><code>UnknownItemError</code></td><td>Không tìm thấy game</td></tr><tr><td><code>InvalidParameterError</code></td><td>K, giá hoặc tham số yêu cầu không hợp lệ</td></tr><tr><td><code>ColdStartError</code></td><td>User chưa có positive profile và không bật fallback</td></tr><tr><td><code>TrainingError</code></td><td>Huấn luyện/callback thất bại hoặc model phân kỳ</td></tr></tbody></table></div>
+<p>Các lớp mới kế thừa RecSysError. Những phần có ngoại lệ riêng chuyển đổi tại ranh giới công khai sang hệ ngoại lệ chung.</p></section>
+<section id="ownership"><h2>9. Vị trí định nghĩa và phân công</h2>
+<div class="table-wrap"><table><thead><tr><th>Thành phần</th><th>Nơi định nghĩa</th><th>Phụ trách chính</th></tr></thead><tbody><tr><td>DTO chung, cấu hình, kiểu kết quả</td><td><code>src/contracts/dto.py</code></td><td>Người tổng hợp contracts; cả nhóm review</td></tr><tr><td>ABC và giao diện chung</td><td><code>src/contracts/interfaces.py</code></td><td>Người tổng hợp contracts; cả nhóm review</td></tr><tr><td>Ngoại lệ chung</td><td><code>src/contracts/exceptions.py</code></td><td>Người tổng hợp contracts</td></tr><tr><td>Dataset, mapper, pipeline, split, review text và artifact bàn giao</td><td>Data Layer</td><td>Người Data</td></tr><tr><td>Public model adapter và backend</td><td>Model Layer</td><td>Người Model</td></tr><tr><td>Features TextBPR từ nguồn text train đã chốt</td><td>Data cung cấp text; Model/feature pipeline tạo X</td><td>Data và Model phối hợp, có một đầu ra X chính thức</td></tr><tr><td>Evaluator, metric, protocol, benchmark</td><td>Evaluation Layer</td><td>Người Evaluation</td></tr><tr><td>Luồng sử dụng, ID gốc, filter, fallback</td><td>Service Layer</td><td>Người Service</td></tr></tbody></table></div>
+<p>Public model adapter thuộc Model Layer, dùng lại cho Service và Benchmark. Khi Model đáp ứng contract chung, Benchmark không cần adapter thứ hai chỉ để đổi tên n_users thành num_users.</p>
+<p>Module cũ có thể import/re-export lớp chung nhằm giảm thay đổi đường dẫn; không định nghĩa lại bản DTO/ABC khác.</p>
+<p>Phần Evaluation không chịu trách nhiệm tự tạo text review, thay Data làm sạch nguồn hoặc tự huấn luyện encoder. Nó kiểm tra và ghi nhận artifacts/fingerprints được các phần cung cấp.</p></section>
+<section id="acceptance"><h2>10. Tiêu chí xác nhận triển khai</h2>
+<p>Dùng một bộ dữ liệu nhỏ chung để kiểm tra:</p>
+<ol>
+<li>Data tạo ba split không trùng cặp, dùng cùng mapping.</li>
+<li><strong>Bàn giao review text thật từ nguồn;</strong> trace được raw/mapped user–game và split, có thống kê text thiếu.</li>
+<li>Text và nhãn/timestamp thuộc đúng bản ghi được giữ sau dedup.</li>
+<li>train.iter_reviews() và train_reviews.jsonl không chứa cặp validation/test; thay nội dung text làm đổi review fingerprint.</li>
+<li>Model fit thành công từ train Dataset; callback chấm được validation và chọn checkpoint.</li>
+<li>Scoring đúng số lượng, thứ tự và kiểu score.</li>
+<li>Service recommend bằng raw user ID; lọc đúng game đã review positive/negative.</li>
+<li>Fallback hoạt động đúng khi bật và được nhận diện trong kết quả.</li>
+<li>Evaluator chấm test, trả EvaluationResult; skips và Data exclusions được báo rõ.</li>
+<li>Benchmark xuất đủ ba file cùng metadata, gồm thông tin review/features khi chạy TextBPR.</li>
+<li>Train thất bại không để Model/Service báo sẵn sàng sai.</li>
+</ol>
+<p>Sau khi bốn thành viên xác nhận bản này, mọi thay đổi ảnh hưởng giao diện chung phải được báo và thống nhất trước khi áp dụng.</p></section>
+<footer><p>Contracts v1 · Cập nhật ngày 05/11/2026 · Bổ sung schema và artifacts review text, iter_reviews, review fingerprint và kiểm tra train-only text. Đây là tài liệu giao ước để nhóm xác nhận, không phải mã triển khai.</p><p>File HTML độc lập, không tải font, ảnh hoặc script từ dịch vụ bên ngoài.</p></footer>
+</main></body></html>
