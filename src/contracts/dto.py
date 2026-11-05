@@ -53,6 +53,9 @@ class RecommendationResult:
     genres: Tuple[str, ...]
     predicted_score: float
     developer: str = "Unknown"
+    price: Optional[float] = None
+    model_name: str = ""
+    is_fallback: bool = False
 
 
 @dataclass(frozen=True)
