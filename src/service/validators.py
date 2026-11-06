@@ -25,6 +25,9 @@ def validate_top_k(top_k: int) -> int:
 
 
 def validate_dataset(dataset: Any, role: str) -> None:
+    if dataset is None:
+        raise DataValidationError(f"{role} dataset cannot be None.")
+
     required = (
         "split_name",
         "interactions",
@@ -108,10 +111,21 @@ def model_matches_dataset(model: BaseRecommender, dataset: Any) -> bool:
 def validate_fallback_model(model: BaseRecommender) -> None:
     if not isinstance(model, BaseRecommender):
         raise InvalidParameterError("fallback_model must be a BaseRecommender instance.")
-    model_name = getattr(model, "name", "").lower()
-    class_name = model.__class__.__name__.lower()
-    if "bpr" in model_name or "bpr" in class_name:
+
+    # Contract Section 7: BPR / TextBPR cannot be used as global fallback models.
+    # Check class hierarchy and declared algorithm capability, NOT arbitrary display string model.name.
+    class_names = [c.__name__.lower() for c in model.__class__.__mro__]
+    is_bpr_type = any(
+        "bpr" in c_name
+        for c_name in class_names
+        if c_name not in {"object", "baserecommender"}
+    )
+    declared_family = getattr(model, "algorithm_family", "").lower()
+    is_declared_bpr = declared_family in {"bpr", "text_bpr", "textbpr"} or getattr(model, "is_bpr", False)
+
+    if is_bpr_type or is_declared_bpr:
         raise ConfigurationError("BPR / TextBPR models cannot be used as global fallback models.")
+
     if not callable(getattr(model, "score_global", None)):
         raise InvalidParameterError("fallback_model must provide score_global(item_ids).")
 

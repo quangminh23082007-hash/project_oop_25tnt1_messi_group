@@ -1,9 +1,11 @@
 """Presentation formatters for recommendation DTOs."""
 
+from typing import Sequence
+
 from src.contracts.dto import RecommendationResult
 
 
-def format_recommendations_table(results: list[RecommendationResult]) -> str:
+def format_recommendations_table(results: Sequence[RecommendationResult]) -> str:
     if not results:
         return "No matching game recommendations found."
     header = (f"{'Rank':<6} | {'Game ID':<10} | {'Title':<24} | {'Genres':<22} | "

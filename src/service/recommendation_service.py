@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Sequence
 
 import numpy as np
 
@@ -74,6 +74,8 @@ class RecommendationService:
             if hasattr(train_dataset, "train") and hasattr(train_dataset, "validation") and hasattr(train_dataset, "test"):
                 train_dataset = train_dataset.train
             validate_dataset(train_dataset, "train")
+            if train_dataset.split_name != "train":
+                raise DataValidationError("train_dataset must have split_name='train'.")
             if not getattr(self._model, "is_fitted", False):
                 raise ModelNotFittedError("model must be fitted if train_dataset is provided at initialization.")
             if not model_matches_dataset(self._model, train_dataset):
@@ -192,7 +194,16 @@ class RecommendationService:
         return frozenset(self._train_dataset.get_user_positive_items(user_idx))
 
     def _new_popularity_model(self) -> BaseRecommender:
-        for module_name in ("src.models", "src.models.popularity", "popularity"):
+        for module_name in (
+            "src.models",
+            "src.models.popularity",
+            "src.models.popularity_recommender",
+            "src.model",
+            "src.model.popularity",
+            "models.popularity",
+            "models",
+            "popularity",
+        ):
             try:
                 module = import_module(module_name)
                 model_cls = getattr(module, "PopularityRecommender", None)
@@ -388,6 +399,39 @@ class RecommendationService:
             ))
             if len(results) == top_k:
                 break
+
+        if (
+            not is_fallback
+            and len(results) < top_k
+            and request_k < self._train_dataset.num_items
+            and len(scored_items) == request_k
+        ):
+            all_scored = self._model.recommend(
+                mapped_user_idx,
+                self._train_dataset,
+                top_k=self._train_dataset.num_items,
+                exclude_seen=exclude_played,
+            )
+            seen_result_ids = {r.game_id for r in results}
+            for scored in all_scored:
+                raw_game_id = self._raw_item_id(scored.item_idx)
+                if raw_game_id in seen_result_ids:
+                    continue
+                try:
+                    game = self._train_dataset.get_game_by_raw_id(raw_game_id)
+                except (KeyError, IndexError, UnknownItemError):
+                    continue
+                if not isinstance(game, GameItem):
+                    raise DataValidationError("get_game_by_raw_id must return a GameItem instance.")
+                if not game_passes_filters(game, criteria):
+                    continue
+                results.append(to_recommendation_result(
+                    scored, game, len(results) + 1, self.model_name, is_fallback=False
+                ))
+                seen_result_ids.add(raw_game_id)
+                if len(results) == top_k:
+                    break
+
         return results
 
     def get_user_played_games(self, raw_user_id: str) -> List[GameItem]:
@@ -443,7 +487,7 @@ class RecommendationService:
         return result
 
     @staticmethod
-    def format_recommendations_table(results: List[RecommendationResult]) -> str:
+    def format_recommendations_table(results: Sequence[RecommendationResult]) -> str:
         return format_recommendations_table(results)
 
 

@@ -20,13 +20,13 @@ def to_recommendation_result(
     if price is not None:
         price = float(price)
     return RecommendationResult(
-        rank=rank,
+        rank=int(rank),
         game_id=str(getattr(game, "item_id", "")).strip(),
         title=str(getattr(game, "title", "") or "").strip(),
         genres=genres,
         predicted_score=float(scored.score),
         price=price,
         developer=str(getattr(game, "developer", "Unknown") or "Unknown").strip() or "Unknown",
-        model_name=model_name,
-        is_fallback=is_fallback,
+        model_name=str(model_name),
+        is_fallback=bool(is_fallback),
     )
