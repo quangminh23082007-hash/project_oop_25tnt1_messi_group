@@ -99,6 +99,54 @@ class PretrainedTests(unittest.TestCase):
             installer.install(archive, self.root / 'installed', 'bpr', installer.sha256_file(archive))
         self.assertFalse((self.root / 'installed/bpr').exists())
 
+    def test_invalid_catalog_is_rejected_during_load(self):
+        path = self.bundle / "model_info.json"
+        original = json.loads(path.read_text(encoding="utf-8"))
+
+        cases = [
+            ("missing", None),
+            ("null", None),
+            ("list", []),
+            ("blank_id", {" ": {}}),
+            ("null_entry", {"g0": None}),
+            ("list_entry", {"g0": []}),
+            ("numeric_title", {"g0": {"title": 123}}),
+            ("blank_title", {"g0": {"title": "   "}}),
+            ("numeric_image", {"g0": {"image_url": 123}}),
+            ("string_categories", {"g0": {"categories": "Action"}}),
+            ("invalid_category", {"g0": {"categories": [123]}}),
+        ]
+
+        for name, catalog in cases:
+            with self.subTest(case=name):
+                info = dict(original)
+                if name == "missing":
+                    info.pop("catalog")
+                else:
+                    info["catalog"] = catalog
+                path.write_text(json.dumps(info), encoding="utf-8")
+
+                with self.assertRaisesRegex(DataValidationError, "catalog"):
+                    PretrainedRecommender.load(self.bundle)
+
+    def test_missing_optional_catalog_fields_remain_supported(self):
+        path = self.bundle / "model_info.json"
+        original = json.loads(path.read_text(encoding="utf-8"))
+
+        for catalog in (
+            {},
+            {"g0": {}},
+            {"g0": {"title": None}},
+            {"g0": {"title": ""}},
+        ):
+            with self.subTest(catalog=catalog):
+                info = dict(original)
+                info["catalog"] = catalog
+                path.write_text(json.dumps(info), encoding="utf-8")
+
+                model = PretrainedRecommender.load(self.bundle)
+                self.assertEqual(model.get_game_details("g0").title, "g0")
+
 
 if __name__ == '__main__':
     unittest.main()
