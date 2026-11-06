@@ -11,7 +11,9 @@ import pandas as pd
 
 try:  # sandbox không có pyarrow: stub để import được loader/ingest, chỉ đường CSV được kiểm tra
     import pyarrow  # noqa: F401
+    HAS_PYARROW = True
 except Exception:
+    HAS_PYARROW = False
     from unittest.mock import MagicMock
     sys.modules["pyarrow"] = MagicMock(); sys.modules["pyarrow.parquet"] = MagicMock()
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -22,7 +24,7 @@ from src.contracts import dto, exceptions as exc
 from src.contracts.interfaces import BaseRecommender
 from src.data import DataPipeline, GameItem, SplitConfig
 from src.data.dataset import InteractionDataset
-from src.data.ingest import _timestamps
+from src.data.ingest import _timestamps, build_parquet_from_raw
 from src.data.loader import ParquetDataLoader
 from src.data.parsing import clean_id, label_from_rating, text_or_none, to_price, to_timestamp
 from src.data.pipeline import _split_sizes
@@ -41,10 +43,14 @@ def write_case(tmp, rows, n_games=12, with_text=True):
     (tmp / "games.json").write_text(json.dumps(games))
     with open(tmp / "interactions.csv", "w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        header = ["user_id", "game_id", "recommended", "post_date"] + (["review"] if with_text else [])
-        writer.writerow(header)
-        for user, game, rec, date, review in rows:
-            writer.writerow([user, game, "Recommended" if rec else "Not Recommended", date] + ([review] if with_text else []))
+        writer.writerow(["user_id", "game_id", "recommended", "post_date"])
+        for user, game, rec, date, _ in rows:
+            writer.writerow([user, game, "Recommended" if rec else "Not Recommended", date])
+    with open(tmp / "reviews.csv", "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["user_id", "game_id", "review"])
+        if with_text:
+            writer.writerows((user, game, review) for user, game, _, _, review in rows)
     return str(tmp / "games.json"), str(tmp / "interactions.csv")
 
 
@@ -72,35 +78,72 @@ assert clean_id("570.0") == "570.0" and clean_id(570.0) == "570" and clean_id(57
 assert text_or_none("  giữ nguyên  ") == "  giữ nguyên  " and text_or_none("   ") is None and text_or_none(None) is None
 try: label_from_rating(3.5); raise SystemExit("phải lỗi")
 except exc.DataValidationError: pass
-s = _timestamps(pd.Series(["2020-01-01", "May 14, 2020", "1577836800", "", "bad", "May 14", "20-Jul-15", "-100"]))
+s, invalid_timestamps = _timestamps(pd.Series(["2020-01-01", "May 14, 2020", "1577836800", "", "bad", "May 14", "20-Jul-15", "-100"]))
 assert s.tolist() == [MS_2020, 1589414400000, MS_2020, 0, 0, 0, 1437350400000, 0], s.tolist()
+assert invalid_timestamps == 4
+bad_stamps, invalid_timestamps = _timestamps(pd.Series(["inf", "1e20", "-1", "1577836800"]))
+assert bad_stamps.tolist() == [0, 0, 0, MS_2020] and invalid_timestamps == 3
 ok("parsing: timestamp mili giây, ngày không có năm = 0, ID chỉ chuẩn hóa khoảng trắng, text giữ nguyên")
 
-# ---------------------------------------------------------------- cỡ split 70/10/20
+# ---------------------------------------------------------------- cỡ split 70/15/15
 cfg = SplitConfig()
-assert (cfg.val_ratio, cfg.test_ratio, cfg.random_state, cfg.strategy) == (0.1, 0.2, 42, "random")
-assert [_split_sizes(n, cfg) for n in (3, 4, 10, 20, 100)] == [(1, 1), (1, 1), (1, 2), (2, 4), (10, 20)]
+assert (cfg.val_ratio, cfg.test_ratio, cfg.random_state, cfg.strategy) == (0.15, 0.15, 42, "random")
+assert [_split_sizes(n, cfg) for n in (3, 4, 10, 20, 100)] == [(1, 1), (1, 1), (1, 1), (3, 3), (15, 15)]
 a = DataPipeline._assign_splits(np.repeat([0, 1, 2], [10, 3, 2]).astype(np.int64), np.zeros(15, dtype=np.int64), 3, cfg)
-assert [int((a[:10] == c).sum()) for c in (0, 1, 2)] == [7, 1, 2]          # n=10 -> 7/1/2
+assert [int((a[:10] == c).sum()) for c in (0, 1, 2)] == [8, 1, 1]          # n=10 -> 8/1/1
 assert [int((a[10:13] == c).sum()) for c in (0, 1, 2)] == [1, 1, 1]        # n=3
 assert (a[13:] == 0).all()                                                # n=2 -> toàn bộ train
 for bad in (dict(val_ratio=0), dict(test_ratio=1), dict(val_ratio=.6, test_ratio=.5), dict(random_state=True), dict(strategy="x")):
     try: SplitConfig(**bad); raise SystemExit(f"phải lỗi {bad}")
     except exc.InvalidParameterError: pass
-ok("split mặc định 70/10/20: val=max(1,floor(.1n)), test=max(1,floor(.2n)); user <3 tương tác chỉ có train")
+ok("split mặc định 70/15/15: val=max(1,floor(.15n)), test=max(1,floor(.15n)); user <3 tương tác chỉ có train")
 
 tmp = Path(tempfile.mkdtemp())
 games_path, inter_path = write_case(tmp, random_rows())
 loader = ParquetDataLoader()
 records = loader.load_interactions(inter_path)
 assert all(isinstance(r, dto.InteractionRecord) and r.rating in (0.0, 1.0) for r in records)
-assert loader.load_stats["rows_read"] == len(records) and loader.load_stats["text_column_present"] == 1
-assert any(r.text for r in records) and all(r.text is None or r.text.strip() for r in records)
+assert loader.load_stats["rows_read"] == len(records) and not hasattr(records[0], "text")
 assert all(type(g) is dto.GameItem for g in loader.load_games(games_path).values())
-ok("loader: đọc cột text từ nguồn interactions, nhãn 0/1, đếm dòng đọc")
+ok("loader: InteractionRecord không chứa review text; nhãn 0/1 và thống kê dòng đọc")
+
+if HAS_PYARROW:
+    raw_root = Path(tempfile.mkdtemp())
+    raw_reviews = raw_root / "Games_Reviews"
+    raw_reviews.mkdir()
+    (raw_root / "games.json").write_text(json.dumps({"1": {"name": "Game 1"}}), encoding="utf-8")
+    with open(raw_reviews / "1_3.csv", "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["user", "recommend", "post_date", "review"])
+        writer.writerows(
+            [
+                ["bad_inf", "Recommended", "inf", "review inf"],
+                ["bad_range", "Not Recommended", "1e20", "review out of range"],
+                ["valid", "Recommended", "2020-01-01", "valid review"],
+            ]
+        )
+    raw_out = raw_root / "processed"
+    build_parquet_from_raw(
+        raw_out,
+        games_json=raw_root / "games.json",
+        reviews_dir=raw_reviews,
+        min_reviews_per_game=0,
+        chunksize=3,
+        verbose=False,
+    )
+    raw_interactions = pd.read_parquet(raw_out / "interactions.parquet")
+    raw_report = json.loads((raw_out / "ingest_report.json").read_text(encoding="utf-8"))
+    assert "text" not in raw_interactions.columns
+    assert raw_interactions["timestamp"].tolist() == [0, 0, MS_2020]
+    assert raw_report["rows_written"] == 3 and raw_report["rows_with_invalid_timestamp"] == 2
+    with open(raw_out / "reviews.csv", encoding="utf-8", newline="") as handle:
+        raw_reviews_rows = list(csv.DictReader(handle))
+    assert len(raw_reviews_rows) == 3 and raw_reviews_rows[2]["review"] == "valid review"
+    ok("raw ingest: timestamp hỏng về 0 và được đếm; dòng hợp lệ vẫn ghi; review nằm riêng trong reviews.csv")
 
 pipeline = DataPipeline()
-splits = pipeline.prepare(games_path, inter_path)
+reviews_path = str(Path(inter_path).with_name("reviews.csv"))
+splits = pipeline.prepare(games_path, inter_path, reviews_path=reviews_path)
 tr, va, te = splits.train, splits.validation, splits.test
 assert isinstance(splits, dto.DatasetSplits) and (tr.split_name, va.split_name, te.split_name) == ("train", "validation", "test")
 
@@ -143,19 +186,20 @@ for ds in (tr, va, te):
 assert {(r.user_id, r.item_id) for r in tr.iter_reviews()} <= key(tr)
 assert not ({(r.user_id, r.item_id) for r in tr.iter_reviews()} & (key(va) | key(te)))
 assert tr.num_reviews + va.num_reviews + te.num_reviews > 0
-raw_text = {(r.user_id, r.item_id): r.text for r in records if r.text}
+review_frame = pd.read_csv(reviews_path, dtype=str, na_filter=False)
+raw_text = {(row.user_id, row.game_id): row.review for row in review_frame.itertuples() if row.review}
 for r in te.iter_reviews():   # text nguyên văn kể cả dấu phẩy, nháy, xuống dòng, Unicode
     assert raw_text[(te.user_mapper.to_raw(r.user_id), te.item_mapper.to_raw(r.item_id))] == r.text
 ok("train.iter_reviews() không chứa cặp val/test; text nguyên văn; nhãn/timestamp khớp interaction")
 
 # ---------------------------------------------------------------- review_fingerprint nhạy với text, nhãn, timestamp
 g = {str(i): GameItem(item_id=str(i), title=f"G{i}") for i in range(1, 4)}
-base = [dto.InteractionRecord("x", "1", 1.0, 100, "great")]
-fp = lambda rec: InteractionDataset(rec, g).review_fingerprint
-assert fp(base) != fp([dto.InteractionRecord("x", "1", 1.0, 100, "gre4t")])    # đổi text
-assert fp(base) != fp([dto.InteractionRecord("x", "1", 0.0, 100, "great")])    # đổi nhãn
-assert fp(base) != fp([dto.InteractionRecord("x", "1", 1.0, 101, "great")])    # đổi timestamp
-assert fp(base) == fp([dto.InteractionRecord("x", "1", 1.0, 100, "great")])    # ổn định
+base = [dto.InteractionRecord("x", "1", 1.0, 100)]
+fp = lambda rec, text: InteractionDataset(rec, g, review_texts={("x", "1"): text}).review_fingerprint
+assert fp(base, "great") != fp(base, "gre4t")    # đổi text
+assert fp(base, "great") != fp([dto.InteractionRecord("x", "1", 0.0, 100)], "great")    # đổi nhãn
+assert fp(base, "great") != fp([dto.InteractionRecord("x", "1", 1.0, 101)], "great")    # đổi timestamp
+assert fp(base, "great") == fp(base, "great")    # ổn định
 ok("review_fingerprint đổi khi đổi text, nhãn hoặc timestamp")
 
 # ---------------------------------------------------------------- dedup giữ dòng đầu, text của dòng được giữ
@@ -163,7 +207,7 @@ rows = random_rows(seed=3)
 rows += [("user 10", "1", True, "2019-02-01", "FIRST text"), ("user 10", "1", False, "2021-05-05", "SECOND text")]
 rows = [r for r in rows if not (r[0] == "user 10" and r[1] == "1" and r[4] not in ("FIRST text", "SECOND text"))]
 t2 = Path(tempfile.mkdtemp()); gp, ip = write_case(t2, rows)
-sp2 = DataPipeline().prepare(gp, ip)
+sp2 = DataPipeline().prepare(gp, ip, reviews_path=str(Path(ip).with_name("reviews.csv")))
 assert sp2.report["rows"]["duplicate_rows_dropped"] == 1 and sp2.report["rows"]["duplicate_pairs_with_conflicting_label"] == 1
 found = None
 for ds in (sp2.train, sp2.validation, sp2.test):
@@ -181,12 +225,17 @@ day = lambda d: f"2020-01-{d:02d}"
 for u in range(6):   # 6 user chuẩn, xoay thứ tự item để mọi item 1..10 đều có trong train
     for k in range(10):
         scenario.append((f"base{u}", str((u + k) % 10 + 1), True, day(k + 1), ""))
-for g_ in range(1, 8): scenario.append(("A", str(g_), True, day(g_), ""))
-scenario += [("A", "8", True, day(8), ""), ("A", "9", True, day(9), ""), ("A", "99", True, day(10), "cold positive")]
+for g_ in range(1, 11): scenario.append(("A", str(g_), True, day(g_), ""))
+scenario += [
+    ("A", "11", True, day(11), ""),
+    ("A", "12", True, day(12), ""),
+    ("A", "98", False, day(13), ""),
+    ("A", "99", True, day(14), "cold positive"),
+]
 for g_ in range(1, 8): scenario.append(("B", str(g_), True, day(g_), ""))
-scenario += [("B", "98", False, day(8), ""), ("B", "9", True, day(9), ""), ("B", "10", True, day(10), "")]
+scenario += [("B", "9", True, day(8), ""), ("B", "98", False, day(9), ""), ("B", "10", True, day(10), "")]
 t3 = Path(tempfile.mkdtemp()); gp, ip = write_case(t3, scenario, n_games=99)
-sp3 = DataPipeline().prepare(gp, ip, split_config=SplitConfig(strategy="temporal"))
+sp3 = DataPipeline().prepare(gp, ip, reviews_path=str(Path(ip).with_name("reviews.csv")), split_config=SplitConfig(strategy="temporal"))
 rep = sp3.report
 assert "99" not in sp3.train.item_mapper.raw_ids and "98" not in sp3.train.item_mapper.raw_ids
 for ds in (sp3.validation, sp3.test):
@@ -242,11 +291,11 @@ json.dumps(r, default=str)
 ok("report đủ mục: rows/users/items tách riêng, text, timestamp, fingerprints, giới hạn user ID")
 
 # ---------------------------------------------------------------- tái lập, không phụ thuộc thứ tự đầu vào
-again = DataPipeline().prepare(games_path, inter_path)
+again = DataPipeline().prepare(games_path, inter_path, reviews_path=reviews_path)
 assert (again.train.fingerprint, again.test.fingerprint) == (tr.fingerprint, te.fingerprint)
 shuffled = list(random_rows()); random.Random(9).shuffle(shuffled)
 t4 = Path(tempfile.mkdtemp()); gp, ip = write_case(t4, shuffled)
-sp4 = DataPipeline().prepare(gp, ip)
+sp4 = DataPipeline().prepare(gp, ip, reviews_path=str(Path(ip).with_name("reviews.csv")))
 assert (sp4.train.fingerprint, sp4.validation.fingerprint, sp4.test.fingerprint) == (tr.fingerprint, va.fingerprint, te.fingerprint)
 other = DataPipeline().prepare(games_path, inter_path, split_config=SplitConfig(random_state=7))
 assert other.train.fingerprint != tr.fingerprint

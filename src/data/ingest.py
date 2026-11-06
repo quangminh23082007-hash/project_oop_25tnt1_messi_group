@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -75,12 +76,12 @@ _HAS_YEAR = r"\d{4}|[-/ ]\d{2}$"  # có năm 4 chữ số, hoặc năm 2 chữ s
 _MS_THRESHOLD = 100_000_000_000  # số < 1e11 coi là epoch giây, ngược lại là mili giây
 
 
-def _timestamps(series: pd.Series) -> pd.Series:
+def _timestamps(series: pd.Series) -> Tuple[pd.Series, int]:
     """
     post_date -> Unix mili giây UTC (int64, >= 0) theo contract.
 
     Số thì giữ nguyên (nhỏ hơn 1e11 coi là giây và nhân 1000); chuỗi ngày thì parse.
-    Ngày không có năm (ví dụ "May 14") hoặc không đọc được thì 0, không đoán năm.
+    Ngày không có năm (ví dụ "May 14") hoặc giá trị không hợp lệ thì 0; trả thêm số dòng lỗi.
     Parse nhanh theo định dạng suy ra từ dòng đầu, dòng lệch định dạng được parse lại riêng.
     """
     text = series.astype(str).str.strip()
@@ -100,8 +101,20 @@ def _timestamps(series: pd.Series) -> pd.Series:
 
     from_dates = (parsed - pd.Timestamp("1970-01-01", tz="UTC")).dt.total_seconds() * 1000.0
     from_numbers = numeric.where(numeric >= _MS_THRESHOLD, numeric * 1000.0)
-    millis = from_dates.fillna(from_numbers).fillna(0.0).clip(lower=0.0)
-    return millis.round().astype("int64")
+    finite_numbers = pd.Series(
+        np.isfinite(numeric.to_numpy(dtype="float64", na_value=np.nan)), index=series.index
+    )
+    int64_limit = float(2**63)
+    valid_numbers = (
+        numeric.notna()
+        & finite_numbers
+        & from_numbers.ge(0)
+        & from_numbers.lt(int64_limit)
+    )
+    valid_dates = parsed.notna() & from_dates.ge(0) & from_dates.lt(int64_limit)
+    valid = valid_numbers | valid_dates
+    millis = from_dates.where(valid_dates, from_numbers.where(valid_numbers, 0.0))
+    return millis.round().astype("int64"), int((~valid).sum())
 
 
 class _InteractionWriter:
@@ -115,7 +128,6 @@ class _InteractionWriter:
             ("playtime", pa.float64()),
             ("helpfulness", pa.float64()),
             ("timestamp", pa.int64()),
-            ("text", pa.string()),
         ]
     )
 
@@ -206,9 +218,9 @@ def build_parquet_from_raw(
 
     Nhãn: recommended (bool) giữ nguyên, loader đổi thành rating 1.0/0.0.
     post_date đổi thành timestamp Unix mili giây UTC (0 nếu không đáng tin cậy).
-    Review text ghi nguyên văn vào cột `text` của interactions.parquet (include_reviews=False thì để trống),
-    nên text đi cùng đúng dòng tương tác. Dedup (user, game) do DataPipeline làm (giữ dòng đầu theo thứ
-    tự file/dòng, có đếm), ingest giữ nguyên thứ tự file rồi dòng.
+    Review text được ghi riêng vào reviews.csv, không nằm trong interactions.parquet.
+    Dedup (user, game) do DataPipeline làm (giữ dòng đầu theo thứ tự file/dòng, có đếm),
+    ingest giữ nguyên thứ tự file rồi dòng.
     Bỏ game không có trong games.json, file có ít đánh giá hơn ngưỡng, dòng thiếu user hoặc nhãn lạ.
     Ghi file tạm rồi đổi tên khi xong.
     """
@@ -233,13 +245,21 @@ def build_parquet_from_raw(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     games_path, interactions_path = out / "games.parquet", out / "interactions.parquet"
+    reviews_path = out / "reviews.csv"
     report_path = out / "ingest_report.json"
 
     def temporary(path: Path) -> Path:
         return path.with_name(path.name + ".tmp")
 
     stage_path = out / "interactions.stage1.tmp"
-    temp_files = [temporary(games_path), temporary(interactions_path), stage_path]
+    review_stage_path = out / "reviews.stage.tmp"
+    temp_files = [
+        temporary(games_path),
+        temporary(interactions_path),
+        stage_path,
+        temporary(reviews_path),
+        review_stage_path,
+    ]
 
     log(f"[build] games.json     : {games_json}")
     log(f"[build] Games_Reviews  : {reviews_dir}")
@@ -268,14 +288,21 @@ def build_parquet_from_raw(
     skipped = 0
     bad_recommend = 0
     review_count = 0
+    invalid_timestamps = 0
     rows_read = 0
     rows_missing_user = 0
     column_cache: Dict[Tuple[str, ...], Dict[str, str]] = {}
 
     pass1_writer: Optional[_InteractionWriter] = None
     final_writer: Optional[_InteractionWriter] = None
+    review_handle = None
+    review_writer = None
     try:
         pass1_writer = _InteractionWriter(stage_path if second_pass else temporary(interactions_path))
+        if include_reviews:
+            review_handle = open(review_stage_path, "w", encoding="utf-8", newline="")
+            review_writer = csv.writer(review_handle)
+            review_writer.writerow(["user_id", "game_id", "review"])
 
         for index, (item_id, path) in enumerate(files, 1):
             try:
@@ -315,6 +342,18 @@ def build_parquet_from_raw(
                     else:
                         texts = [None] * len(chunk)
                     review_count += sum(1 for t in texts if t is not None)
+                    if review_writer is not None:
+                        review_writer.writerows(
+                            (user, item_id, text)
+                            for user, text in zip(users.tolist(), texts)
+                            if text is not None
+                        )
+
+                    if "timestamp" in columns:
+                        timestamps, invalid_count = _timestamps(chunk[columns["timestamp"]])
+                        invalid_timestamps += invalid_count
+                    else:
+                        timestamps = 0
 
                     frame = pd.DataFrame(
                         {
@@ -325,10 +364,7 @@ def build_parquet_from_raw(
                             "helpfulness": (
                                 _numeric(chunk[columns["helpfulness"]]) if "helpfulness" in columns else 0.0
                             ),
-                            "timestamp": (
-                                _timestamps(chunk[columns["timestamp"]]) if "timestamp" in columns else 0
-                            ),
-                            "text": texts,
+                            "timestamp": timestamps,
                         }
                     )
                     pass1_writer.add(frame)
@@ -344,6 +380,9 @@ def build_parquet_from_raw(
                 log(f"[build] {index:,}/{len(files):,} file | {pass1_writer.rows:,} tương tác")
 
         pass1_writer.close()
+        if review_handle is not None:
+            review_handle.close()
+            review_handle = None
 
         if pass1_writer.rows == 0:
             raise EmptyDatasetError(
@@ -368,6 +407,18 @@ def build_parquet_from_raw(
             kept_games = final_writer.game_ids
             total_rows = final_writer.rows
 
+        if include_reviews:
+            if second_pass:
+                with open(temporary(reviews_path), "w", encoding="utf-8", newline="") as output:
+                    writer = csv.writer(output)
+                    writer.writerow(["user_id", "game_id", "review"])
+                    with open(review_stage_path, "r", encoding="utf-8", newline="") as source:
+                        reader = csv.reader(source)
+                        next(reader, None)
+                        writer.writerows(row for row in reader if row[0] in valid_users)
+            else:
+                os.replace(review_stage_path, temporary(reviews_path))
+
         selected = [
             game for item_id, game in games.items() if not only_games_with_reviews or item_id in kept_games
         ]
@@ -375,6 +426,8 @@ def build_parquet_from_raw(
 
         os.replace(temporary(interactions_path), interactions_path)
         os.replace(temporary(games_path), games_path)
+        if include_reviews:
+            os.replace(temporary(reviews_path), reviews_path)
         report_path.write_text(
             json.dumps(
                 {
@@ -383,6 +436,7 @@ def build_parquet_from_raw(
                     "rows_skipped_bad_recommend": bad_recommend,
                     "rows_written": total_rows,
                     "rows_with_text": review_count,
+                    "rows_with_invalid_timestamp": invalid_timestamps,
                     "files_skipped_on_error": skipped,
                     "files_processed": len(files),
                     "min_reviews_per_game": min_reviews_per_game,
@@ -396,6 +450,8 @@ def build_parquet_from_raw(
             encoding="utf-8",
         )
     except BaseException:
+        if review_handle is not None:
+            review_handle.close()
         if pass1_writer is not None:
             try:
                 pass1_writer.close()
@@ -411,6 +467,7 @@ def build_parquet_from_raw(
         raise
     finally:
         stage_path.unlink(missing_ok=True)
+        review_stage_path.unlink(missing_ok=True)
 
     log(
         f"[build] Xong: {len(selected):,} game, {total_rows:,} tương tác, "

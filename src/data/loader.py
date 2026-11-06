@@ -91,7 +91,6 @@ class ParquetDataLoader(BaseDataLoader):
     load_interactions: interactions.parquet, hoặc CSV phẳng có user_id và game_id/item_id.
       Nhãn rating nhị phân: cột rating (đã 0/1) nếu có, không thì Recommended=1.0, Not Recommended=0.0.
       Timestamp (cột timestamp/post_date) về Unix mili giây, thiếu thì 0.
-      Cột text/review (nếu có) vào InteractionRecord.text, giữ nguyên nội dung; thiếu hoặc trống là None.
     Sau mỗi lần load_interactions, `load_stats` ghi số dòng đọc và số dòng bị loại theo từng lý do.
     """
 
@@ -116,8 +115,6 @@ class ParquetDataLoader(BaseDataLoader):
             "rows_read": 0,
             "rows_skipped_missing_id": 0,
             "rows_skipped_bad_label": 0,
-            "rows_with_text": 0,
-            "text_column_present": 0,
         }
         if path.suffix.lower() == ".csv":
             records = self._load_interactions_csv(path)
@@ -138,7 +135,7 @@ class ParquetDataLoader(BaseDataLoader):
     ) -> Tuple[Dict[Tuple[str, str], str], Dict[str, int]]:
         """
         Đọc file review rời (CSV: user, game, review) thành {(user_id, game_id): text}.
-        Dùng khi nguồn interactions chưa có cột text. Cặp lặp thì giữ dòng đầu tiên.
+        Dùng khi cần nạp text tách riêng khỏi InteractionRecord. Cặp lặp thì giữ dòng đầu tiên.
         Nội dung text giữ nguyên; dòng trống bị bỏ và đếm trong stats.
         """
         path = _require_source_path(reviews_path)
@@ -307,9 +304,6 @@ class ParquetDataLoader(BaseDataLoader):
         timestamp_col = _pick_column(names, ("timestamp", "post_date"))
         if timestamp_col:
             mapping["timestamp"] = timestamp_col
-        text_col = _pick_column(names, ("text", "review"))
-        if text_col:
-            mapping["text"] = text_col
         return mapping
 
     def _records_from_columns(
@@ -322,9 +316,7 @@ class ParquetDataLoader(BaseDataLoader):
         ratings = payload.get(columns["rating"]) if "rating" in columns else None
         recommended = payload.get(columns["recommended"]) if "recommended" in columns else None
         timestamps = payload.get(columns["timestamp"]) if "timestamp" in columns else None
-        texts = payload.get(columns["text"]) if "text" in columns else None
         stats = self.load_stats
-        stats["text_column_present"] = int(texts is not None)
 
         records: List[InteractionRecord] = []
         for index, (user_id, item_id) in enumerate(zip(users, items)):
@@ -346,9 +338,6 @@ class ParquetDataLoader(BaseDataLoader):
                 stats["rows_skipped_bad_label"] += 1
                 continue
 
-            text = text_or_none(texts[index]) if texts is not None else None
-            if text is not None:
-                stats["rows_with_text"] += 1
             timestamp = to_timestamp(timestamps[index]) if timestamps is not None else 0
             records.append(
                 InteractionRecord(
@@ -356,7 +345,6 @@ class ParquetDataLoader(BaseDataLoader):
                     item_id=item_key,
                     rating=label,
                     timestamp=timestamp,
-                    text=text,
                 )
             )
         return records

@@ -140,6 +140,7 @@ class InteractionDataset:
         split_name: str = "train",
         user_mapper: Optional[IdMapper] = None,
         item_mapper: Optional[IdMapper] = None,
+        review_texts: Optional[Mapping[Tuple[str, str], str]] = None,
     ) -> None:
         if records is None or isinstance(records, (str, bytes)):
             raise DataValidationError("records phải là một dãy InteractionRecord.")
@@ -183,7 +184,8 @@ class InteractionDataset:
                 raise UnknownItemError(f"Không tìm thấy item '{item_key}'.", item_id=item_key)
             users[pos], items[pos] = user_idx, item_idx
             ratings[pos], stamps[pos] = float(record.rating), int(record.timestamp)
-            row_texts[pos] = text_or_none(record.text)
+            if review_texts is not None:
+                row_texts[pos] = text_or_none(review_texts.get((user_key, item_key)))
 
         # Trùng (user, item): giữ dòng đầu tiên theo thứ tự đầu vào (argsort ổn định).
         keys = users * stride + items
@@ -300,11 +302,11 @@ class InteractionDataset:
 
     @property
     def records(self) -> Tuple[InteractionRecord, ...]:
-        """InteractionRecord với id thô, kèm text nếu có (dựng lười)."""
+        """InteractionRecord với id thô, không chứa review text (dựng lười)."""
         if self._records is None:
             self._records = tuple(
-                InteractionRecord(user_id=u, item_id=i, rating=r, timestamp=t, text=x)
-                for u, i, r, t, x in self.iter_raw_rows()
+                InteractionRecord(user_id=u, item_id=i, rating=r, timestamp=t)
+                for u, i, r, t, _ in self.iter_raw_rows()
             )
         return self._records
 

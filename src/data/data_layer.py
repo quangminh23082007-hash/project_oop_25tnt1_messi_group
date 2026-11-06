@@ -51,7 +51,7 @@ def main(
     Chưa có Parquet, hoặc rebuild=True, thì tạo từ dữ liệu gốc trước.
     build_options truyền thẳng cho build_parquet_from_raw (min_reviews_per_game,
     min_interactions_per_user, ...).
-    reviews_path chỉ cần khi interactions.parquet chưa có cột text (Parquet cũ).
+    reviews_path là nguồn text tách riêng, chỉ được đọc khi được truyền vào.
     export_dir: nếu có thì ghi bộ artifact review của contract (reviews.csv, *_reviews.jsonl,
     mapping.json, data_report.json) vào đó.
     """
@@ -78,7 +78,7 @@ def main(
     splits = pipeline.prepare(
         str(games_path),
         str(interactions_path),
-        reviews_path=str(reviews_path) if reviews_path else None,
+        reviews_path=str(reviews_path) if reviews_path is not None else None,
         split_config=split_config,
     )
     if export_dir:
@@ -121,6 +121,8 @@ def _print_summary(splits: DatasetSplits) -> None:
           f"thiếu/trống: {text['pairs_missing_or_blank_text']:,} | "
           f"item train có review: {text['train_items_with_review']:,}")
     print(f"Timestamp = 0: {report['timestamp']['zero_ratio']:.1%}")
+    print(f"Timestamp lỗi đã thay bằng 0 ở ingest: "
+          f"{report['timestamp']['invalid_rows_from_ingest']:,} dòng")
 
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -128,13 +130,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, help="Thư mục chứa file Parquet")
     parser.add_argument("--raw-dir", type=Path, help="Thư mục chứa games.json và Games_Reviews")
     parser.add_argument("--output-dir", type=Path, help="Nơi lưu Parquet mới tạo")
-    parser.add_argument("--reviews-path", type=Path, help="CSV review rời (chỉ cần với Parquet cũ chưa có cột text)")
+    parser.add_argument("--reviews-path", type=Path, help="CSV review rời; chỉ nạp text khi được truyền")
     parser.add_argument("--rebuild", action="store_true", help="Tạo lại Parquet từ dữ liệu gốc")
     parser.add_argument("--min-reviews-per-game", type=int, default=5)
     parser.add_argument("--min-interactions-per-user", type=int, default=1)
     parser.add_argument("--strategy", choices=("random", "temporal"), default="random")
-    parser.add_argument("--val-ratio", type=float, default=0.1)
-    parser.add_argument("--test-ratio", type=float, default=0.2)
+    parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument("--test-ratio", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--export-dir", type=Path, help="Ghi bộ artifact review của contract vào thư mục này")
     parser.add_argument("--price-currency", default="unspecified", help="Đơn vị tiền tệ của price, ghi vào report")

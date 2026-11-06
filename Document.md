@@ -10,11 +10,11 @@ Data layer biến dữ liệu thô (`games.json` và thư mục `Games_Reviews/*
 
 Luồng xử lý:
 
-1. `ingest.py` đọc dữ liệu thô và ghi ra `games.parquet`, `interactions.parquet` (đã tích hợp sẵn cột `text` và `timestamp` mili giây), cùng `ingest_report.json`. Chỉ chạy khi chưa có Parquet hoặc khi `rebuild=True`.
+1. `ingest.py` đọc dữ liệu thô và ghi ra `games.parquet`, `interactions.parquet` (không chứa review text), `reviews.csv` (review text tách riêng) và `ingest_report.json`. Chỉ chạy khi chưa có Parquet hoặc khi `rebuild=True`.
 
-2. `loader.py` (`ParquetDataLoader`) đọc Parquet/CSV thành `InteractionRecord` (có trường `text`) và `GameItem` của contract, đồng thời thống kê các dòng bị loại do thiếu ID hoặc sai nhãn.
+2. `loader.py` (`ParquetDataLoader`) đọc Parquet/CSV thành `InteractionRecord` (không có trường review text) và `GameItem` của contract, đồng thời thống kê các dòng bị loại do thiếu ID hoặc sai nhãn.
 
-3. `pipeline.py` (`DataPipeline`) là cổng chuẩn bị dữ liệu chính: gắn review text, khử trùng lặp (dedup), chia tập theo từng user (`70/10/20`), **fit `IdMapper` duy nhất từ `train` rồi đóng băng**, lọc dữ liệu ngoài mapping ở `validation`/`test`, dựng 3 `InteractionDataset` bất biến và xuất bộ artifacts bàn giao (`export_artifacts`).
+3. `pipeline.py` (`DataPipeline`) là cổng chuẩn bị dữ liệu chính: chỉ nạp review text từ `reviews_path` khi được yêu cầu, khử trùng lặp (dedup), chia tập theo từng user (`70/15/15`), **fit `IdMapper` duy nhất từ `train` rồi đóng băng**, lọc dữ liệu ngoài mapping ở `validation`/`test`, dựng 3 `InteractionDataset` bất biến và xuất bộ artifacts bàn giao (`export_artifacts`).
 
 4. `dataset.py` (`IdMapper`, `Catalog`, `InteractionDataset`) quản lý cấu trúc dữ liệu chỉ đọc, tính toán `mapping_fingerprint`, `fingerprint` và `review_fingerprint`.
 
@@ -49,11 +49,11 @@ src/
 | :--- | :--- |
 | Nhãn rating | Nhị phân: `Recommended = 1.0`, `Not Recommended = 0.0`. Không còn thang 1–5, không chứa điểm Wilson hay playtime. |
 | Trùng cặp (user, item) | Loại dòng lỗi trước khi dedup. Mỗi cặp giữ **bản ghi hợp lệ đầu tiên** theo thư tự file/dòng xác định (`argsort(kind="stable")`). Nhãn, timestamp và text cam kết lấy từ cùng một bản ghi được giữ. |
-| Timestamp | `int >= 0`, **Unix mili giây UTC**, lấy từ cột `post_date`/`timestamp`. Ngày thiếu năm (như `"May 14"`) hoặc không đọc được thì gán `0`. |
-| Chuẩn hóa ID & Text | ID gốc chỉ `.strip()` khoảng trắng, không đổi hoa/thường hay sửa nội dung. Review text giữ nguyên văn chuỗi gốc và Unicode; thiếu hoặc toàn khoảng trắng thì là `None`. |
+| Timestamp | `int >= 0`, **Unix mili giây UTC**, lấy từ cột `post_date`/`timestamp`. Giá trị không hữu hạn, âm, ngoài miền int64, ngày thiếu năm (như `"May 14"`) hoặc không đọc được thì gán `0` và đếm trong `ingest_report.json`. |
+| Chuẩn hóa ID & Text | ID gốc chỉ `.strip()` khoảng trắng, không đổi hoa/thường hay sửa nội dung. Review text giữ nguyên văn chuỗi gốc và Unicode trong `reviews.csv`; không nằm trong `InteractionRecord` hay `interactions.parquet`. |
 | Chỉ số id & Mapping | `user_mapper` và `item_mapper` được **fit duy nhất từ toàn bộ tương tác `train`** (cả `1.0` và `0.0`) rồi đóng băng (`0..N-1`). `validation` và `test` dùng chung đúng bộ mapper này, không tự mở rộng mapping và không gán `-1`. |
 | Xử lý ID ngoài mapping | Ở `validation`/`test`: nếu một user có bất kỳ tương tác **positive (`1.0`)** nào nằm ngoài mapping `train`, **toàn bộ user đó bị loại khỏi phép chấm của split đó** và được ghi nhận; các dòng **negative (`0.0`)** ngoài mapping thì chỉ bỏ dòng đó và đếm riêng. |
-| Cách chia (`SplitConfig`) | Mặc định đã thống nhất: **Per-user random split, seed `42`, tỷ lệ `70% / 10% / 20%`** (`val_ratio=0.1`, `test_ratio=0.2`). User có $n < 3$ tương tác: đưa toàn bộ vào `train`. User có $n \ge 3$ tương tác: $\text{val} = \max(1, \lfloor 0.1n \rfloor)$, $\text{test} = \max(1, \lfloor 0.2n \rfloor)$, còn lại vào `train`. Đầu vào được sắp xếp xác định trước khi chia nên kết quả không phụ thuộc thứ tự dòng hay `chunksize`. |
+| Cách chia (`SplitConfig`) | Mặc định đã thống nhất: **Per-user random split, seed `42`, tỷ lệ `70% / 15% / 15%`** (`val_ratio=0.15`, `test_ratio=0.15`). User có $n < 3$ tương tác: đưa toàn bộ vào `train`. User có $n \ge 3$ tương tác: $\text{val} = \max(1, \lfloor \text{val_ratio}n \rfloor)$, $\text{test} = \max(1, \lfloor \text{test_ratio}n \rfloor)$, còn lại vào `train`. Đầu vào được sắp xếp xác định trước khi chia nên kết quả không phụ thuộc thứ tự dòng hay `chunksize`. |
 | Chiến lược chia | `"random"` (mặc định chuẩn của Contracts v1) hoặc `"temporal"` (tùy chọn mở rộng ngoài v1: cũ nhất vào `train`, mới nhất vào `test`, yêu cầu dữ liệu có timestamp thật $> 0$). |
 | Tính bất biến (Read-only) | Mọi mảng numpy bên trong `InteractionDataset` đều khóa `writeable = False`. Đã bỏ các hàm sửa đổi sau khởi tạo (`split()`, `add_reviews_batch()`). |
 | GameItem & GameStats | `GameItem` là `src.contracts.dto.GameItem` (`title` rỗng lấy `item_id`, `price` thiếu/âm là `None`). Thông tin ngoài contract (`positive`, `negative`, `tags`, `wilson_rating`) tách sang `GameStats`. Game chỉ có trong interactions được tạo `GameItem` tổng hợp, đếm bằng `num_synthetic_items`. |
@@ -80,7 +80,7 @@ pipeline = DataPipeline(price_currency="USD")
 splits = pipeline.prepare(
     games_path="data/processed/games.parquet",
     interactions_path="data/processed/interactions.parquet",
-    split_config=SplitConfig(val_ratio=0.1, test_ratio=0.2, random_state=42, strategy="random"),
+    split_config=SplitConfig(val_ratio=0.15, test_ratio=0.15, random_state=42, strategy="random"),
 )
 ```
 
@@ -124,7 +124,7 @@ self._is_fitted = True
   * `Popularity` đếm tương tác dương (`rating == 1.0`) trong `train`.
   * `BPR` / `TextBPR` học từ các cặp dương (`1.0`), nhưng dùng toàn bộ tương tác đã quan sát trong `train` (cả `1.0` và `0.0`, lấy qua `get_user_seen_items`) để chặn khi lấy mẫu âm (negative sampling).
 * **Text và `ItemFeatures` cho TextBPR.**
-  * Kiểm tra `splits.report["text"]["available"]` trước khi chạy TextBPR. Nếu nguồn không có review text, cờ này sẽ là `False` kèm cảnh báo.
+  * Kiểm tra `splits.report["text"]["available"]` trước khi chạy TextBPR. Nếu chưa truyền `reviews_path`, cờ này sẽ là `False` kèm hướng dẫn.
   * Chỉ đọc review từ `train.iter_reviews()` hoặc file `train_reviews.jsonl`. Tuyệt đối không nối cả 3 file JSONL để học encoder/vocabulary/IDF.
   * Khi tạo `ItemFeatures`, dùng `train.item_mapper.raw_ids` làm `item_ids` để hàng `i` ứng với item nội bộ `i`; gán `mapping_fingerprint = train.mapping_fingerprint`, `train_fingerprint = train.fingerprint`, và `text_fingerprint = train.review_fingerprint`.
 * **Không còn item ngoài mapping ở Validation/Test.** Do mapping được đóng băng từ `train` và Data layer đã lọc các dòng ngoài mapping theo đúng quy tắc của Contract, mọi `item_id` xuất hiện trong `validation` và `test` đều nằm trong khoảng `0 .. num_items - 1`.
@@ -278,10 +278,10 @@ python -m src.data.data_layer --raw-dir ./data/raw --output-dir ./data/processed
 * `--data-dir`: Thư mục chứa file Parquet.
 * `--raw-dir`: Thư mục chứa `games.json` và `Games_Reviews`.
 * `--output-dir`: Nơi lưu Parquet mới tạo.
-* `--reviews-path`: File CSV review rời (chỉ cần khi dùng Parquet cũ chưa có cột `text`).
+* `--reviews-path`: File CSV review rời; review text chỉ được nạp khi truyền đường dẫn này.
 * `--rebuild`: Tạo lại Parquet từ dữ liệu gốc.
 * `--min-reviews-per-game` (mặc định `5`), `--min-interactions-per-user` (mặc định `1`).
-* `--strategy {random,temporal}` (mặc định `random`), `--val-ratio` (mặc định `0.1`), `--test-ratio` (mặc định `0.2`), `--seed` (mặc định `42`).
+* `--strategy {random,temporal}` (mặc định `random`), `--val-ratio` (mặc định `0.15`), `--test-ratio` (mặc định `0.15`), `--seed` (mặc định `42`).
 * `--export-dir`: Thư mục xuất bộ artifacts review text và report.
 * `--price-currency`: Đơn vị tiền tệ ghi vào report (mặc định `"unspecified"`).
 
@@ -298,7 +298,7 @@ python test_data_layer.py
 
 **Vì sao tốn RAM:**
 * Bước nạp (`loader.py`) tạo danh sách `InteractionRecord` trước khi `DataPipeline` chuyển sang các mảng numpy đóng băng.
-* Review chữ được giữ trong bộ nhớ theo từng cặp `(user, item)` có text để phục vụ `iter_reviews()` và tính `review_fingerprint`. Với hàng triệu review dài, chuỗi văn bản là phần chiếm nhiều RAM nhất.
+* `InteractionRecord` và `interactions.parquet` không giữ review text. Chỉ khi truyền `reviews_path`, pipeline mới nạp text để phục vụ `iter_reviews()` và tính `review_fingerprint`; nếu không, các split không giữ review text.
 * Thuộc tính `dataset.interactions` và `dataset.records` được khởi tạo lười (lazy) ở lần truy cập đầu tiên rồi cache lại thành tuple các đối tượng Python.
 * Bước `ingest.py` và `export_artifacts()` ghi theo từng lô/luồng nên rất nhẹ RAM.
 
@@ -312,7 +312,7 @@ python test_data_layer.py
 
 **Cách giảm RAM:**
 1. Tăng `min_reviews_per_game` và `min_interactions_per_user` khi build để thu nhỏ dữ liệu ngay từ bước tạo Parquet.
-2. Nếu chỉ thử nghiệm `Popularity` hoặc `BPR` trên máy ít RAM và chưa cần chạy `TextBPR`, có thể build Parquet với `include_reviews=False` (lúc này report sẽ tự động ghi nhận `text.available = False` và cảnh báo không đủ điều kiện chạy `TextBPR`).
+2. Chỉ truyền `reviews_path` khi cần chạy mô hình dùng review text. Có thể build với `include_reviews=False` để bỏ qua việc ghi `reviews.csv`.
 3. Tránh gọi `dataset.records` trên tập dữ liệu hàng chục triệu dòng; khi xuất file hoặc duyệt dữ liệu thô, hãy dùng `dataset.iter_raw_rows()` hoặc `dataset.iter_reviews()` (duyệt theo generator, không tạo tuple khổng lồ).
 4. Build Parquet và xuất artifacts trên Kaggle (30 GB RAM), sau đó tải bộ file đã xử lý về máy local.
 
@@ -331,7 +331,7 @@ Trong quá trình xử lý và thiết kế theo Contracts v1, data layer có m�
 
 ## 11. Lưu ý chung và cập nhật so với bản cũ
 
-* **Parquet cũ phải rebuild.** Parquet tạo ở phiên bản trước lưu `timestamp` theo giây và chưa tích hợp sẵn cột `text` trong `interactions.parquet`; cần chạy lại với `rebuild=True` để đồng bộ sang **Unix mili giây UTC** và giữ review text đi kèm từng dòng tương tác.
+* **Parquet cũ nên rebuild.** Chạy lại với `rebuild=True` để đồng bộ `timestamp` sang **Unix mili giây UTC** và tạo `reviews.csv` riêng; `interactions.parquet` mới không chứa review text.
 * **Những thay đổi API quan trọng đã áp dụng theo Contracts v1:**
   * Thay `make_splits()` và `dataset.split()` bằng `DataPipeline.prepare()` (hoặc gọi thẳng `main()` trả về `DatasetSplits`).
   * Thay quy tắc dedup từ "giữ dòng có timestamp mới nhất" sang **"giữ dòng hợp lệ đầu tiên theo thứ tự file/dòng xác định"** và đếm số cặp có nhãn mâu thuẫn.

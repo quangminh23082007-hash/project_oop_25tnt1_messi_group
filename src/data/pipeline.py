@@ -3,7 +3,7 @@ DataPipeline: nguồn dữ liệu -> DatasetSplits theo Contracts v1.
 
 Luồng:
   1. Đọc games và interactions (dòng sai bị loại và được đếm ở loader).
-  2. Gắn review text (từ cột text của nguồn, hoặc từ reviews_path nếu nguồn chưa có).
+  2. Gắn review text từ reviews_path nếu được cung cấp.
   3. Dedup theo (user, game): giữ dòng hợp lệ đầu tiên theo thứ tự file/dòng; đếm trùng và nhãn mâu thuẫn.
   4. Chia theo từng user trên ID thô: train / validation / test.
   5. FIT MAPPING TỪ TRAIN rồi đóng băng. Validation/test chỉ được ánh xạ bằng mapping này.
@@ -42,7 +42,7 @@ SPLIT_NAMES = ("train", "validation", "test")
 @dataclass(frozen=True)
 class SplitConfig:
     """
-    Mặc định đã thống nhất: per-user random, seed 42, 70% / 10% / 20%.
+    Mặc định đã thống nhất: per-user random, seed 42, 70% / 15% / 15%.
     Số dòng mỗi tập của user có n >= 3 tương tác:
       validation = max(1, floor(val_ratio * n)), test = max(1, floor(test_ratio * n)), train = phần còn lại.
     strategy="temporal" là tùy chọn ngoài v1 (cũ nhất vào train, mới nhất vào test) và cần timestamp thật.
@@ -122,15 +122,14 @@ class DataPipeline:
         i_arr = np.fromiter((item_code[r.item_id] for r in records), dtype=np.int64, count=n_rows)
         rating = np.fromiter((r.rating for r in records), dtype=np.float64, count=n_rows)
         stamp = np.fromiter((r.timestamp for r in records), dtype=np.int64, count=n_rows)
-        texts: List[Optional[str]] = [r.text for r in records]
+        texts: List[Optional[str]] = [None] * n_rows
         text_from_file = 0
         if external:
             for pos, record in enumerate(records):
-                if texts[pos] is None:
-                    found = external.get((record.user_id, record.item_id))
-                    if found is not None:
-                        texts[pos] = found
-                        text_from_file += 1
+                found = external.get((record.user_id, record.item_id))
+                if found is not None:
+                    texts[pos] = found
+                    text_from_file += 1
         rows_with_text_before_dedup = sum(1 for t in texts if t is not None)
 
         # --- dedup: giữ dòng đầu tiên theo thứ tự đầu vào (argsort ổn định)
@@ -366,7 +365,7 @@ class DataPipeline:
             "text": {
                 "available": text_available,
                 "warning": None if text_available else (
-                    "Nguồn không có review text: chưa đáp ứng bộ bàn giao để chạy TextBPR."
+                    "Chưa nạp review text; truyền reviews_path nếu cần chạy TextBPR."
                 ),
                 "text_column_in_source": bool(load_stats.get("text_column_present", 0)),
                 "rows_with_text_in_source": load_stats.get("rows_with_text", 0),
@@ -382,6 +381,9 @@ class DataPipeline:
             "timestamp": {
                 "unit": "milliseconds_utc",
                 "zero_ratio": float((stamp == 0).mean()) if len(stamp) else 1.0,
+                "invalid_rows_from_ingest": (
+                    ingest_report.get("rows_with_invalid_timestamp", 0) if ingest_report else 0
+                ),
             },
             "catalog": {"price_currency": self._price_currency},
             "user_id_source": {
