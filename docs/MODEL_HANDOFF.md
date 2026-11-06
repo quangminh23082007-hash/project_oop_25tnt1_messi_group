@@ -6,8 +6,11 @@ The Data reference is the GitHub `data` branch at `c70e4f4f`; its existing inter
 classes/file formats may remain for this delivery. No full Data/Evaluation v1
 rewrite, new split or retraining is required to serve the saved weights.
 See [PRETRAINED_MODELS.md](PRETRAINED_MODELS.md) for the current path.
+The loader, installer and manifest are now pushed to `models`. Both trained CPU
+bundles are published in the private `pretrained-legacy-v1` release; the linked
+installation guide contains the download and verification steps.
 
-The remainder documents the optional training API implemented against the
+The remainder preserves the earlier preparation checklist and documents the optional training API implemented against the
 [archived v1 design](Contracts_v1_Game_Recommender_2026-11-05.html).
 This contribution implements the Model boundary and proposes the shared v1
 records/interfaces it imports. The team should use these same shared definitions;
@@ -51,7 +54,8 @@ git diff --cached --check
 Add the optional importer only if wanted:
 `git add -- scripts/install_model.py artifacts/README.md`.
 Review shared `src/contracts` changes with the team because every layer imports
-these types. No commit or push was performed as part of this local preparation.
+these types. That earlier local preparation has now been committed and pushed to
+`models`; no other branch was changed.
 
 ## Public model API
 

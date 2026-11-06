@@ -13,6 +13,13 @@ and working training adapters are retained for optional future work.
 
 ## Install and verify this contribution
 
+Clone the `models` branch, or switch an existing checkout to that branch:
+
+```powershell
+git clone --branch models --single-branch https://github.com/quangminh23082007-hash/project_oop_25tnt1_messi_group.git game-recsys-oop
+cd game-recsys-oop
+```
+
 ```powershell
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
@@ -22,8 +29,8 @@ py -3 -m venv .venv
 
 On Linux/macOS use `python3 -m venv .venv` and `.venv/bin/python`.
 Tests run without the future Data layer, external datasets, GPU or model downloads.
-This branch provides the model contribution; a complete application also needs
-model asset publication and the backend/UI connection. Rewriting every layer to
+This branch provides the model contribution and published CPU bundles; a complete
+application also needs the backend/UI connection. Rewriting every layer to
 the earlier v1 training API is no longer a prerequisite for this serving delivery.
 
 ## Contents
@@ -53,19 +60,24 @@ This does not relabel them as models trained under the older v1 80/10/10 design.
 Their recorded provenance and validation reports are in
 [TRAINED_RUN_REFERENCE.json](docs/TRAINED_RUN_REFERENCE.json).
 
-**Release status: assets prepared locally; not published yet.** The planned
-[private release page](https://github.com/quangminh23082007-hash/project_oop_25tnt1_messi_group/releases/tag/pretrained-legacy-v1)
-will provide `bpr-cpu-legacy-v1.zip` and `text-bpr-cpu-legacy-v1.zip` after upload.
-Until then the link is not a working download. The repository owner should follow
-[the publishing instructions](docs/PRETRAINED_MODELS.md). Repository read access
-and GitHub sign-in are required; the weights do not need to be public.
+**Release status: published and verified on 2026-11-06.** The
+[private model release](https://github.com/quangminh23082007-hash/project_oop_25tnt1_messi_group/releases/tag/pretrained-legacy-v1)
+contains these files:
+
+- [BPR CPU bundle](https://github.com/quangminh23082007-hash/project_oop_25tnt1_messi_group/releases/download/pretrained-legacy-v1/bpr-cpu-legacy-v1.zip) (375.4 MB).
+- [TextBPR CPU bundle](https://github.com/quangminh23082007-hash/project_oop_25tnt1_messi_group/releases/download/pretrained-legacy-v1/text-bpr-cpu-legacy-v1.zip) (377.0 MB).
+- [SHA256SUMS.txt](https://github.com/quangminh23082007-hash/project_oop_25tnt1_messi_group/releases/download/pretrained-legacy-v1/SHA256SUMS.txt).
+
+Repository read access and GitHub sign-in are required. Download a named model
+ZIP above; GitHub's automatic **Source code** archives do not contain weights.
+This is a model prerelease, not a complete UI/backend application release.
 
 After downloading the BPR ZIP from that release:
 
 ```powershell
-python -m pip install -e .
-python scripts/install_model.py --archive "C:\Users\HP\Downloads\bpr-cpu-legacy-v1.zip" --model bpr
-python scripts/recommend.py --model bpr --user "!" --k 10
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe scripts/install_model.py --archive "$env:USERPROFILE\Downloads\bpr-cpu-legacy-v1.zip" --model bpr
+.\.venv\Scripts\python.exe scripts/recommend.py --model bpr --user "!" --k 10
 ```
 
 `!` is a source dataset user for a smoke check, not an application account. For
@@ -77,10 +89,10 @@ and then verifies the embedded weight checksum; it refuses to overwrite existing
 models. If a verified bundle is already installed, proceed to the recommendation
 command. TextBPR uses the same commands with `text-bpr` and its corresponding ZIP.
 
-After publication, an alternative for teammates with authenticated GitHub CLI is:
+An alternative for teammates with authenticated GitHub CLI is:
 
 ```powershell
-python scripts/install_model.py --download --model bpr
+.\.venv\Scripts\python.exe scripts/install_model.py --download --model bpr
 ```
 
 Load once in the backend, then reuse for requests:

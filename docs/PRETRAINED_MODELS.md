@@ -4,9 +4,10 @@ The current [Contracts v1.1](Contracts_v1_1_Pretrained_2026-11-06.html) accepts 
 existing bundles as the application model. Keep their original provenance;
 the Data interface reference is GitHub's `data` branch at `c70e4f4f`.
 
-## Prepared deliverables
+## Published deliverables
 
-Two locally generated ZIPs live in `dist/pretrained-release/`:
+The [private release `pretrained-legacy-v1`](https://github.com/quangminh23082007-hash/project_oop_25tnt1_messi_group/releases/tag/pretrained-legacy-v1)
+was published on 2026-11-06 from models commit `b1ed736c`. It contains:
 
 - `bpr-cpu-legacy-v1.zip` — original BPR compact CPU weights and model_info.json.
 - `text-bpr-cpu-legacy-v1.zip` — original TextBPR compact CPU weights and model_info.json.
@@ -19,57 +20,28 @@ contain no raw review text, prepared train data, large encoder or GPU checkpoint
 They do retain source user identifiers and observed training pairs, so distribute
 them within the existing private repository and do not change repository privacy.
 
-The ZIPs are already prepared. `python tools/build_pretrained_release.py` can
+Both uploaded archive sizes and SHA256 hashes match the committed manifest;
+authenticated downloads were checked. Both original ZIPs were installed and
+used for CPU recommendations without retraining before publication.
+
+The owner's local ZIPs remain in `dist/pretrained-release/` (ignored by Git).
+`python tools/build_pretrained_release.py` can
 reproduce packaging from installed compact bundles in a fresh output directory;
 it refuses to overwrite existing release files and never trains a model.
 
-## Publish once (repository owner)
+## Release maintenance
 
-No release has been created by this change. The connected GitHub tools used for
-this task can inspect releases but do not upload binary release assets; GitHub CLI
-is not installed on the inspected laptop. The files and instructions below are
-ready for an upload through GitHub's signed-in website.
+Initial publication is complete. Source changes were pushed only to `models`;
+`main` and other members' branches were not modified. The release is marked as a
+prerelease because it delivers trained models, not the integrated application.
 
-Stage only these source changes from the models checkout (leave other local
-prototypes untracked):
+Keep the published tag, ZIPs and checksums together. If models change later,
+publish a new tag and update the manifest rather than replacing these files
+under the same version. Keep repository visibility private.
 
-```powershell
-Set-Location 'E:\project_OOP\game-recsys-oop'
-git add -- README.md src/models/pretrained.py configs/pretrained_models.json
-git add -- scripts/install_model.py scripts/recommend.py tools/build_pretrained_release.py tests/test_pretrained.py
-git add -- docs/PRETRAINED_MODELS.md docs/PRETRAINED_RELEASE_NOTES.md docs/TEAM_COMPATIBILITY.md
-git add -- docs/Contracts_v1_1_Pretrained_2026-11-06.html docs/TRAINED_RUN_REFERENCE.json docs/MODEL_HANDOFF.md docs/Contracts_v1_Game_Recommender_2026-11-05.html
-git diff --cached --stat
-git diff --cached --check
-git commit -m "Add verified pretrained CPU bundles workflow and serving loader"
-git push --no-follow-tags origin refs/heads/models:refs/heads/models
-```
-
-1. Commit/push the loader, installer, tests, manifest and docs to `models` first.
-   Keep other members' branches and `main` unchanged. The release must target that
-   new commit, not the previous commit that lacked the installer/loader.
-2. Open https://github.com/quangminh23082007-hash/project_oop_25tnt1_messi_group/releases/new
-3. Create tag `pretrained-legacy-v1`, target `models`, title `Pretrained CPU models (legacy Kaggle experiment)`.
-   Mark it a prerelease so it is not confused with a completed v1 application release.
-4. Attach the two ZIPs and SHA256SUMS.txt from `dist/pretrained-release/`. Wait for
-   both uploads to finish. Copy the description in `docs/PRETRAINED_RELEASE_NOTES.md`.
-5. Publish the release. Keep repository visibility private. Open the asset links
-   while signed in and verify their sizes; download/install one as a teammate.
-6. Update README's release-status sentence only after verifying publication.
-
-GitHub Releases support binary assets below 2 GiB each, so both assets fit:
-https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases
-This avoids storing hundreds of MB in normal Git history. A clone does not fetch
-release assets automatically. Teammates with read access can obtain them from
-that private release; an anonymous link alone will not grant access.
-
-With GitHub CLI installed and authenticated, the equivalent publishing command is:
-
-```powershell
-gh release create pretrained-legacy-v1 dist/pretrained-release/bpr-cpu-legacy-v1.zip dist/pretrained-release/text-bpr-cpu-legacy-v1.zip dist/pretrained-release/SHA256SUMS.txt --repo quangminh23082007-hash/project_oop_25tnt1_messi_group --target models --title "Pretrained CPU models (legacy Kaggle experiment)" --notes-file docs/PRETRAINED_RELEASE_NOTES.md --prerelease
-```
-
-This command creates a release/tag and uploads assets, not a merge into main.
+A clone does not fetch release assets automatically. Teammates with repository
+read access can download them while signed in; an anonymous link grants no access.
+Choose the named model ZIPs, not GitHub's automatic Source code archives.
 
 ## Teammate installation
 
@@ -82,7 +54,7 @@ python scripts/install_model.py --archive "C:\Users\HP\Downloads\bpr-cpu-legacy-
 python scripts/recommend.py --model bpr --user "!" --k 3
 ```
 
-Or, after publication and `gh auth login`:
+Or, with GitHub CLI installed and authenticated (`gh auth login`):
 
 ```powershell
 python scripts/install_model.py --download --model bpr

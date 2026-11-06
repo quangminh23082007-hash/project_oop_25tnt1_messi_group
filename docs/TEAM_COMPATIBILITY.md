@@ -5,7 +5,12 @@ accepts the existing trained models for the current application delivery. The
 findings below remain valid comparisons against the older v1 training design,
 but not every mismatch is a blocker for the revised pretrained path.
 
-Required now: publish/install the bundles; connect the inference loader to the
+**Publication update (2026-11-06):** the loader, installer and manifest are pushed
+to `models`, and both verified bundles are available in the
+[private release](https://github.com/quangminh23082007-hash/project_oop_25tnt1_messi_group/releases/tag/pretrained-legacy-v1).
+No changes were pushed to `main` or teammates' branches.
+
+Required now: install the bundles; connect the inference loader to the
 backend/UI; preserve original model mappings; adapt catalog/result fields; handle
 history, fallback, missing metadata and errors correctly; and verify a clean-clone
 CPU startup. Data may keep GitHub branch `c70e4f4f`'s Dataset/Game classes and files.
@@ -97,17 +102,16 @@ In _to_result (line 219), model_name always names the primary model, even for
 popularity fallback. Use the actual fallback model name together with is_fallback.
 Neither bug was changed in the teammate's branch during this task.
 
-## 5. No committed trained-model startup path — addressed locally
+## 5. No committed trained-model startup path — model delivery published
 
-The current remote models branch has no release assets and no committed model
-installer/startup loader. The latest Service has a train method, but no factory
+At the inspected `8acf26f9` models commit, there were no release assets or committed
+model installer/startup loader. The inspected Service has a train method, but no factory
 for attaching the existing format-3 bundles without retraining.
 
-Local additions now provide PretrainedRecommender.load(), recommendation DTOs,
+The published models contribution now provides PretrainedRecommender.load(), recommendation DTOs,
 explicit global fallback, live-history exclusions, optional catalog lookup,
 checksum-verified installation, CLI smoke checks, release packaging and a manifest.
-See PRETRAINED_MODELS.md. These changes are not published merely by writing this
-report: commit/push the selected source files and publish the prepared assets.
+See PRETRAINED_MODELS.md for verified release downloads and installation commands.
 
 The legacy inference loader is deliberately separate from v1 training. Existing
 weights preserve their original 70/15/15 mapping and provenance. No fabricated v1
@@ -208,9 +212,9 @@ no held-out reviews in train.iter_reviews; and changed text changes its fingerpr
 
 - Keep the tested v1 adapters and shared configuration API. Coordinate the official
   X features with Data; use only train reviews and a pinned frozen encoder revision.
-- Commit the locally prepared pretrained loader, installer, release manifest,
-  regression tests and docs, then publish the two verified ZIPs as private Release
-  assets. These additions are still local as of this review.
+- Completed on 2026-11-06: push the pretrained loader, installer, release manifest,
+  regression tests and docs to `models`, and publish both verified ZIPs as private
+  Release assets. The application owner still needs to connect the startup loader.
 - Keep the original format-3 weights with their metadata and ID order. Use the
   inference-only loader for the current demonstration, without pretending it has
   the labelled train Dataset or new-contract fingerprints.
