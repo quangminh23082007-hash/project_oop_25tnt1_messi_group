@@ -1,223 +1,160 @@
-# Evaluation & Benchmark — Contracts v1
+# Evaluation và báo cáo cho đường pretrained v1.1
 
-Phần này đánh giá thứ hạng game bằng Recall@K và NDCG@K.
-Luồng thực nghiệm: fit trên train, chọn checkpoint bằng validation,
-chấm split được chọn và xuất báo cáo.
+## 1. Mục đích và ranh giới
 
-Runner sử dụng API huấn luyện v1; việc nạp bundle pretrained thuộc luồng khác.
+Đường chạy này dùng model đã train để đề xuất game bằng CPU và kiểm tra việc tích hợp inference.
+Runner không gọi `fit`, không chọn lại epoch và không chạy encoder để tạo feature matrix.
+Validation được xuất từ hồ sơ lần train gốc, không được suy ra từ danh sách top-K vừa chạy.
 
-## Môi trường và chạy demo
+Phân biệt ba kết quả:
 
-Cần CPython 3.10 trở lên và NumPy.
-unittest có sẵn trong Python.
-Public Models cần được bàn giao đầy đủ cùng dependency của phần Model.
-Cornac là dependency tùy chọn.
+| Nội dung | Nguồn | Ý nghĩa |
+| --- | --- | --- |
+| Đề xuất | `PretrainedRecommender` chạy với bundle được chọn | Đầu ra inference của run hiện tại |
+| Inference checks | Runner kiểm tra các request và đầu ra hiện tại | Kiểm tra vận hành/hợp đồng, không phải metric xếp hạng |
+| Original validation | `TRAINED_RUN_REFERENCE.json` | Chỉ số đã ghi ở lần train gốc, được nhập lại |
 
-Các lệnh PowerShell sau chạy tại thư mục repo,
-với môi trường .venv đã được tạo:
+Chỉ được gọi là “Recall/NDCG tính lại” khi thực sự có ground truth và chạy lại protocol đánh giá phù hợp.
+Nhiều request inference thành công không tự chứng minh chất lượng đề xuất cao hơn baseline.
+
+## 2. Các file và trách nhiệm
+
+- `benchmarks/run_pretrained.py`: đọc config, nạp một model, chạy request và điều phối báo cáo.
+- `benchmarks/pretrained_report.py`: kiểm tra/định dạng kết quả và ghi các artifact báo cáo.
+- `configs/evaluation_pretrained.json`: model, bundle, reference và request mẫu.
+- `tests/evaluation/test_pretrained.py`: kiểm tra runner/report bằng dữ liệu nhỏ và mock có kiểm soát.
+- `docs/evaluation.md`: quy tắc sử dụng và diễn giải kết quả.
+- `README.md`: hướng dẫn bàn giao và chạy nhanh.
+
+Không định nghĩa lại `GameItem`, `RecommendationResult` hoặc các exception chung trong gói này.
+Không chuyển legacy bundle thành một v1 Dataset bằng metadata/fingerprints tự đặt.
+
+## 3. Phần phải nhận từ Model
+
+Giữ toàn bộ `src/models/` và `src/contracts/` thống nhất, cùng NumPy trong môi trường `.venv`.
+Không chỉ lấy `pretrained.py` và `_array`: `src/models/__init__.py` còn import các public modules khác.
+Cần installer/manifest từ Model cùng `docs/TRAINED_RUN_REFERENCE.json` đúng phiên bản.
+Sáu file Evaluation này không thay thế các thành phần đó và không chứa weights.
+
+Release model là private; tài khoản tải cần quyền đọc repository/release.
+Clone source không tự tải các asset ZIP của release.
+Chọn asset `bpr-cpu-legacy-v1.zip` hoặc model tương ứng, không chọn ZIP Source code tự động.
+Installer kiểm tra checksum; không đổi tên model_info/weights hoặc ghép hai bundle khác nhau.
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install numpy
-.\.venv\Scripts\python.exe -B -m benchmarks.run_benchmark --config configs/evaluation.json
+.\.venv\Scripts\python.exe -m pip install "numpy>=1.24,<3"
+.\.venv\Scripts\python.exe scripts/install_model.py --download --model bpr
 ```
 
-Để chạy demo cùng Cornac thật:
+Lệnh download dùng GitHub CLI đã đăng nhập; cách cài ZIP local xem `docs/PRETRAINED_MODELS.md` của Model.
+Các lệnh dùng CPython trong `.venv` của dự án, tránh chạy nhầm Python MSYS hoặc môi trường khác.
+Chỉ cài editable bằng `pip install -e .` khi đã có `pyproject.toml` tương ứng; đây không phải bước mặc định.
+
+Cách cài từ ZIP đã tải trong Downloads, không cần GitHub CLI:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install cornac
-.\.venv\Scripts\python.exe -B -m benchmarks.run_benchmark --config configs/evaluation.json --with-cornac
+.\.venv\Scripts\python.exe -B scripts/install_model.py --archive "$env:USERPROFILE\Downloads\bpr-cpu-legacy-v1.zip" --model bpr
 ```
 
-## Kiểm thử
+Inference không cần train lại, PyTorch/CUDA, Qwen encoder hoặc toàn bộ raw reviews.
+Nạp bundle một lần cho mỗi lần chạy runner; backend ứng dụng nên giữ object đã nạp cho nhiều request.
+Nhiều backend worker sẽ nạp các bản model riêng, nên cần kiểm tra RAM thực tế.
 
-```powershell
-.\.venv\Scripts\python.exe -B -m unittest discover -s tests/evaluation -v
-.\.venv\Scripts\python.exe -B -m unittest discover -s tests/evaluation -p test_model_integration.py -v
-```
-
-| File | Phạm vi |
-|---|---|
-| conftest.py | Dataset, mapper, reviews và model điểm cố định cho tests |
-| test_metrics.py | Công thức, protocol, shared DTO và báo cáo |
-| test_evaluator.py | Dataset API, cohort, fingerprints, ranking và runner |
-| test_cornac_adapter.py | Mapping, positive counts, trạng thái fit và Cornac |
-| test_model_integration.py | Public Models đến Evaluation và báo cáo |
-
-Khi chưa có src.models, ba bài integration được skipped.
-Khi chưa cài Cornac, một bài Cornac thật được skipped.
-Package có mặt nhưng import hỏng sẽ làm tests lỗi.
-
-Fixtures có cả review tích cực và tiêu cực.
-Encoder hai chiều là đầu vào kiểm thử và không tải model ngoài.
-Tests xuất báo cáo vào TemporaryDirectory rồi tự dọn.
-Điểm demo/fixtures chỉ phục vụ kiểm tra kỹ thuật.
-
-## API và đầu vào
+## 4. Cấu hình và API
 
 ```python
-from src.evaluation import EvaluationProtocol, Evaluator, summarize_result
+from benchmarks.run_pretrained import run_pretrained
 
-evaluator = Evaluator(EvaluationProtocol(ks=(5, 10)))
-result = evaluator.evaluate(model, train_dataset, test_dataset)
-summary = summarize_result(result)
-```
-
-Model phải đã fit.
-Callback validation nhận public candidate có thể scoring ở epoch hiện tại.
-Data bàn giao DatasetSplits gồm train, validation, test và preparation report.
-
-Mỗi Dataset cần:
-
-- interactions chứa shared Interaction.
-- Dimensions và số interaction nhất quán.
-- Mappers có size phù hợp.
-- mapping_fingerprint, fingerprint và review_fingerprint không rỗng.
-
-IDs là chỉ số nội bộ bắt đầu từ 0.
-Rating đúng 0 hoặc 1.
-Timestamp là UTC milliseconds hoặc 0 nếu không biết.
-Interaction không tồn tại là ý kiến chưa biết, không tự biến thành rating 0.
-
-Mappings được fit từ toàn bộ train interactions rồi giữ cố định.
-Evaluator kiểm tra range, duplicates, cặp giao nhau, dimensions và mapping.
-Model.train_fingerprint phải khớp train.fingerprint.
-Fingerprints được so sánh bằng giá trị thay vì identity object.
-
-Data/Model chịu trách nhiệm tạo fingerprints đúng.
-Data chịu trách nhiệm clean, chia split và xử lý raw IDs ngoài mapping.
-Evaluator không kiểm tra chronology giữa các split.
-
-## Protocol
-
-1. Relevant là game có rating 1 trong split đang đánh giá.
-2. User cần có ít nhất một positive train interaction.
-3. Seen chứa mọi train interaction, cả positive và negative.
-4. Candidates là toàn bộ game trong mapping train trừ seen.
-5. Target interactions không được dùng làm seen history.
-6. Score giảm dần, hòa điểm theo item ID tăng dần.
-7. Điểm tổng hợp là trung bình trên user thực sự được chấm.
-
-Recall chia cho toàn bộ số relevant.
-IDCG của NDCG dùng min(K, số relevant), kể cả khi ranking ngắn hơn K.
-
-Additional seen mặc định None.
-Chỉ được truyền validation khi chấm test:
-
-```python
-result = evaluator.evaluate(
-    model,
-    train_dataset,
-    test_dataset,
-    additional_seen_dataset=validation_dataset,
+paths = run_pretrained(
+    "configs/evaluation_pretrained.json",
+    user_ids=["!"],
+    output_dir="results/pretrained",
 )
 ```
 
-Additional history không bổ sung positive train profile.
+Đây là API chạy một lượt và xuất báo cáo; gọi lại API sẽ thực hiện một run mới.
+`user_ids=None` dùng danh sách trong config; đối số được truyền vào thay danh sách đó.
+`top_k`, fallback và lịch sử bổ sung lấy từ config.
 
-Skips dùng SkippedUser với reason:
-
-- no_positive_train.
-- empty_ground_truth.
-- no_candidates.
-
-Data exclusions được giữ riêng trong preparation report.
-
-Evaluator có thể trả metrics={} khi không có user đủ điều kiện.
-Exporter ghi no_eligible_users và để ô metric trống.
-Runner dừng nếu split được chọn không có user được chấm.
-Callback báo lỗi nếu thiếu selection metric, không thay bằng điểm 0.
-
-## Cấu hình thật và TextBPR
-
-configs/evaluation.json dùng synthetic demo, K = 3, 5.
-configs/evaluation_real.json dùng public Popularity/BPR,
-K = 5, 10 và mục tiêu NDCG@10.
-
-Tham số BPR là cấu hình khởi đầu,
-chưa được tối ưu bằng thực nghiệm.
-
-Cấu hình real dùng source=provided,
-cần truyền DatasetSplits qua Python:
-
-```python
-from benchmarks.run_benchmark import run_benchmark
-
-paths = run_benchmark(
-    "configs/evaluation_real.json",
-    dataset_splits=splits,
-)
+```powershell
+.\.venv\Scripts\python.exe -m benchmarks.run_pretrained --config configs/evaluation_pretrained.json
+.\.venv\Scripts\python.exe -m benchmarks.run_pretrained --user "!" --user "ID_NGUON_KHAC"
+.\.venv\Scripts\python.exe -m benchmarks.run_pretrained --user "!" --output-dir results/pretrained
 ```
 
-splits là đầu vào được Data bàn giao.
-CLI đơn lẻ chưa tạo được đầu vào provided.
+CLI có `--config`, `--user` lặp lại và `--output-dir`; không có tùy chọn `--top-k`.
+Mọi đường dẫn tương đối được resolve từ gốc dự án chứa `benchmarks/`, kể cả config, bundle, reference và output.
+Quy tắc này cũng áp dụng cho `--output-dir`; nó không lấy thư mục chứa config hoặc cwd tùy ý làm gốc.
+Các ví dụ chạy từ thư mục gốc dự án. Sửa config khi muốn đổi model hoặc K.
+Mặc định là BPR tại `artifacts/models/bpr/cpu` và K=10.
+Khi chọn TextBPR, đổi đồng thời model và model_dir để trỏ đúng bundle; không chỉ đổi nhãn báo cáo.
+Runner nhận `text_bpr` hoặc alias `text-bpr`; reference dùng key `text_bpr`.
 
-Khi có provider v1 thật, có thể dùng source=provider
-với module:function và kwargs.
-Đường dẫn trong kwargs do provider quản lý.
+## 5. ID, mapping, lịch sử và metadata
 
-Seed cấu hình là mặc định để tạo model.
-Runner không chia lại splits hoặc đổi seed của model truyền sẵn.
-Tên cấu hình là nhãn thực nghiệm.
-Metadata giữ cả public_model_name.
+`user_ids` là ID nguồn nằm trong mapping của bundle, không phải chỉ số hàng hoặc tên tài khoản mới của app.
+`!` là request mẫu của bundle đã bàn giao; bundle khác có thể cần một ID nguồn khác.
+Không thay mapping trong bundle bằng mapping của Data mới, kể cả khi dimensions trùng nhau.
 
-Cornac mặc định tắt.
-Sau khi cài, API có thể nhận include_cornac=True.
+`exclude_played=true` loại lịch sử đã quan sát lưu cùng bundle.
+`extra_seen` chứa các raw game IDs ứng dụng muốn loại thêm, chẳng hạn game vừa review/đã sở hữu.
+`exclude_played=false` tắt cả lịch sử trong bundle và lịch sử bổ sung theo API loader.
+User ngoài mapping mặc định gây lỗi; không tự mượn user 0 và không sinh kết quả rỗng giả thành công.
 
-Runner nhận ItemFeatures hoặc (ItemFeatures, report) cho TextBPR.
-Provider chỉ nhận train.
+Nếu chủ động bật fallback, loader dùng Popularity toàn cục và kết quả phải thể hiện `is_fallback=true`.
+Fallback là một chính sách serving, không phải bằng chứng cá nhân hóa user mới.
+Không nối user mới với profile nguồn chỉ vì tên hiển thị giống nhau.
 
-Builder chính thức src.models.text_features.build_item_features
-dùng train.iter_reviews(), gồm positive và negative reviews,
-rồi trả features/report.
+`game_id` trong kết quả là raw ID; `predicted_score` là điểm xếp hạng, không phải số sao hoặc xác suất.
+Giữ cả score âm hoặc score lớn hơn 1; không ép về thang 0–1 để trình bày.
+Catalog trong bundle có thể thiếu genres/price; categories không tự biến thành genres và giá thiếu không là miễn phí.
+Muốn bổ sung catalog cho app, dùng adapter theo raw game ID trả shared `GameItem`; không đổi thứ tự hàng weights.
+Đường config tối thiểu này không tự nối một catalog Data tùy ý hoặc bổ sung UI/endpoint.
 
-Encoder thực hiện inference do bên gọi cung cấp
-và cần revision cố định.
-Feature rows phải đúng thứ tự train item mapper,
-khớp ba fingerprints, hữu hạn và có norm 1 hoặc zero.
+## 6. Bốn artifact đầu ra
 
-Cấu hình real chưa chọn TextBPR sẵn.
-Để thêm, cần model kind=text_bpr và features theo đúng nhãn
-qua provider hoặc item_features.
+Một run thành công tạo một thư mục kết quả riêng:
 
-Metadata lưu report có thật, encoder, fingerprints, shape,
-ordered item-ID checksum và matrix checksum.
-Checksum ma trận dùng float64 little-endian
-theo thứ tự C cùng header.
+| File | Cách đọc |
+| --- | --- |
+| `recommendations.csv` | Các đề xuất thực, kèm user, thứ hạng, score và fallback |
+| `inference_checks.json` | Những kiểm tra vận hành đã thực hiện cho run hiện tại |
+| `original_validation.csv` | Các metric validation nhập từ reference; không phải test mới |
+| `run_config.json` | Cấu hình hiệu lực và thông tin nguồn để truy vết |
 
-Không suy ra thiếu text chỉ từ việc vector bằng zero.
+Đọc nhãn nguồn/provenance trước khi đưa số vào báo cáo thuyết trình.
+Không đổi nhãn original validation thành test, accuracy hoặc “benchmark vừa chạy”.
+Không tự chèn 0 khi thiếu metric, thiếu reference hoặc không đủ dữ liệu đánh giá.
+Không coi kết quả của mock loader là kết quả đo bằng model thật.
 
-## Báo cáo
+Runner gọi recommend hai lần cho mỗi user và so sánh kết quả để kiểm tra tính lặp lại.
+`inference_seconds` gồm đọc lịch sử, cả hai lần recommend, kiểm tra và chuyển đổi kết quả trong vòng lặp.
+`load_seconds` đo riêng lời gọi loader, không bao gồm mọi bước đọc config/reference trước đó.
+Không diễn giải các số này thành latency trung bình một request hoặc phép benchmark thông lượng.
 
-| File | Nội dung |
-|---|---|
-| summary.csv | Metric trung bình, status, số user, lý do skip và thời gian |
-| per_user.csv | Metric từng user, candidate count, recommendation và relevant IDs |
-| skipped_users.csv | ID từng user bị bỏ qua và reason |
-| run_config.json | Cấu hình, phiên bản, Data report, fingerprints và model/features metadata |
+## 7. Protocol gốc và giới hạn
 
-Danh sách trong CSV được mã hóa JSON.
-Recommendation giữ thứ tự; relevant IDs được sort.
+Bundle đang được phân phối thuộc lần chạy legacy random 70/15/15 và giữ mapping/provenance gốc.
+Không đổi lời mô tả thành v1 80/10/10 chỉ vì source hiện tại đã có contracts mới.
+Reference hiện ghi validation trên mẫu 2.000 user; số user eligible và toàn bộ user mapping là các đại lượng khác.
+Random split không tự chứng minh khả năng dự đoán tương lai theo thời gian.
+Danh tính user nguồn chưa được xác thực và có thể là tên hiển thị; đọc metric cùng hạn chế này.
 
-Số user/lý do được suy ra từ records.
-DTO frozen; dùng dataclasses.replace để bổ sung timing.
+Original validation nhập cả BPR, TextBPR và Popularity của cùng hồ sơ gốc; không có nghĩa runner đã nạp cả hai model.
+Việc nhập lại những số đó không huấn luyện/chạy Cornac trong run hiện tại.
+Muốn benchmark lại phải có artifacts/ground truth gốc và tái hiện cùng cohort, candidate history và K.
+Không thay protocol hoặc tạo một bộ ground truth ngẫu nhiên rồi gắn metric vào weights cũ.
 
-CSV của runner chứa split được chọn.
-Validation summary nằm trong run_config.json.
+## 8. Kiểm thử và phần v1 giữ lại
 
-Mỗi run có thư mục riêng.
-Exporter từ chối ghi đè và kiểm tra dữ liệu trước khi ghi.
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests/evaluation -p test_pretrained.py -v
+```
 
-## Chẩn đoán
-
-- src.contracts.evaluator không tồn tại:
-  kiểm tra có dán nhầm Evaluation exports vào contracts/__init__.py không.
-- Unexpected keyword train_interactions:
-  runner hoặc tests vẫn dùng API cũ.
-- Thiếu src.models:
-  cần bàn giao package Model trước khi chạy model thật.
-- source=provided thiếu dataset_splits:
-  truyền DatasetSplits qua Python API.
-- FrozenInstanceError:
-  dùng dataclasses.replace thay vì gán field.
-- Không tìm thấy NumPy:
-  chọn interpreter .venv và cài thư viện vào đúng môi trường.
+Bộ test mới gồm các ca report dùng thư viện chuẩn và các ca tích hợp với public loader thật trên bundle NumPy nhỏ.
+Nếu thiếu Model hoặc NumPy, các ca tích hợp phải ghi lý do skip; không báo chúng là đã chạy thành công.
+Bundle nhỏ trong test không phải asset Kaggle. Sau khi cài asset, chạy thêm một lượt CPU với user thật trong mapping.
+Không khẳng định toàn bộ bộ test v1 cũ đã tương thích chỉ vì bộ test này pass.
+File cũ `test_cornac_adapter.py` đang chứa integration tests khác; gói này không khôi phục Cornac regression suite.
+Các module metric/Evaluator và runner training v1 có thể giữ làm công việc tùy chọn sau.
+Chúng không phải bước bắt buộc để nạp bundle, và không được tự train lại ở startup ứng dụng.
