@@ -1,7 +1,14 @@
+from src.contracts.dto import (
+    EvaluationResult,
+    Interaction,
+    SkippedUser,
+    UserEvaluation,
+)
+
 from .evaluator import Evaluator
 from .metrics import NDCGAtK, RankingMetric, RecallAtK
-from .protocol import EvaluationProtocol, Interaction, RankingModel, validate_interactions
-from .result import EvaluationResult, UserEvaluation, save_results
+from .protocol import EvaluationProtocol, RankingModel, validate_interactions
+from .result import save_results, summarize_result
 
 
 __all__ = [
@@ -10,10 +17,12 @@ __all__ = [
     "RecallAtK",
     "NDCGAtK",
     "EvaluationProtocol",
-    "Interaction",
     "RankingModel",
+    "Interaction",
     "validate_interactions",
     "EvaluationResult",
     "UserEvaluation",
+    "SkippedUser",
+    "summarize_result",
     "save_results",
 ]

@@ -64,7 +64,17 @@ class InvalidParameterError(RecSysError, ValueError):
     """Raised when query or operational parameters such as top_k <= 0 or test_ratio outside (0, 1) are passed."""
 
 
+class ColdStartError(RecSysError):
+    """A user has no positive training profile and fallback is disabled."""
+
+
+class TrainingError(RecSysError, RuntimeError):
+    """Training or its validation callback failed; the model is invalidated."""
+
+
 __all__ = [
+    "ColdStartError",
+    "TrainingError",
     "RecSysError",
     "DataValidationError",
     "EmptyDatasetError",

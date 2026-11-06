@@ -9,16 +9,22 @@
     "cold_start_policy": "skip"
   },
   "data": {
-    "source": "demo",
-    "train_csv": null,
-    "validation_csv": null,
-    "test_csv": null,
-    "num_users": null,
-    "num_items": null
+    "source": "demo"
   },
+  "models": [
+    {
+      "kind": "demo_popularity",
+      "name": "DemoPopularity",
+      "early_stopping": false
+    }
+  ],
   "benchmark": {
     "include_cornac": false,
-    "split": "test"
+    "split": "test",
+    "early_stopping": false,
+    "selection_metric": "NDCG@5",
+    "history": "train",
+    "verbose": false
   },
   "output_dir": "results"
 }
