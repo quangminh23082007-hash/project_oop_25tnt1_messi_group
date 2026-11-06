@@ -20,21 +20,21 @@ def is_missing(val: object) -> bool:
 
 
 def clean_id(val: object) -> str:
-    """ID về str, bỏ .0 của số thực nguyên và khoảng trắng."""
+    """
+    ID về str, chỉ chuẩn hóa khoảng trắng (contract: không đổi hoa/thường hay nội dung ID).
+    Giá trị số được đổi kiểu sang chuỗi; số thực nguyên (570.0) thành "570".
+    """
     if is_missing(val):
         return ""
     if isinstance(val, bool):
         return ""
-    if isinstance(val, int):
-        return str(val)
+    if isinstance(val, Integral):
+        return str(int(val))
     if isinstance(val, float):
         if val.is_integer():
             return str(int(val))
         return str(val).strip()
-    text = str(val).strip()
-    if text.endswith(".0") and text[:-2].isdigit():
-        return text[:-2]
-    return text
+    return str(val).strip()
 
 
 def to_float(value: object, default: float = 0.0) -> float:
@@ -69,34 +69,49 @@ _DATE_FORMATS = (
     "%b %d, %Y",
     "%d %B, %Y",
     "%d %b, %Y",
+    "%d-%b-%y",   # 20-Jul-15
+    "%d-%b-%Y",   # 20-Jul-2015
+    "%m/%d/%Y",   # 7/20/2015 (tháng trước ngày, kiểu Mỹ như Excel hiển thị)
+    "%m/%d/%y",
 )
 
+# Số < 1e11 coi là epoch giây (đến năm 5138), từ 1e11 trở lên coi là mili giây (từ năm 1973).
+_MS_THRESHOLD = 100_000_000_000
 
-def _epoch(moment: datetime) -> int:
+
+def _epoch_ms(moment: datetime) -> int:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     try:
-        return max(0, int(moment.timestamp()))
+        return max(0, int(round(moment.timestamp() * 1000)))
     except (OverflowError, OSError, ValueError):
         return 0
 
 
+def _number_ms(number: float) -> int:
+    if not math.isfinite(number) or number <= 0:
+        return 0
+    return int(number * 1000) if number < _MS_THRESHOLD else int(number)
+
+
 def to_timestamp(value: object) -> int:
     """
-    timestamp của InteractionRecord: int >= 0 (epoch giây, UTC).
+    timestamp của InteractionRecord theo contract: int >= 0, Unix mili giây UTC.
+    0 nghĩa là chưa có thời gian đáng tin cậy.
 
-    Nhận số, chuỗi số, datetime/date hoặc chuỗi ngày. Không đọc được hoặc âm thì 0.
+    Nhận số (nhỏ hơn 1e11 coi là giây, ngược lại là mili giây), chuỗi số,
+    datetime/date hoặc chuỗi ngày có năm. Không đọc được hoặc âm thì 0.
     """
     if is_missing(value) or isinstance(value, bool):
         return 0
     if isinstance(value, datetime):
-        return _epoch(value)
+        return _epoch_ms(value)
     if isinstance(value, date):
-        return _epoch(datetime(value.year, value.month, value.day))
+        return _epoch_ms(datetime(value.year, value.month, value.day))
     if isinstance(value, Integral):
-        return max(0, int(value))
+        return _number_ms(float(int(value)))
     if isinstance(value, float):
-        return max(0, int(value)) if math.isfinite(value) else 0
+        return _number_ms(value)
 
     text = str(value).strip()
     if not text:
@@ -106,17 +121,27 @@ def to_timestamp(value: object) -> int:
     except ValueError:
         pass
     else:
-        return max(0, int(number)) if math.isfinite(number) else 0
+        return _number_ms(number)
     try:
-        return _epoch(datetime.fromisoformat(text))
+        return _epoch_ms(datetime.fromisoformat(text))
     except ValueError:
         pass
     for fmt in _DATE_FORMATS:
         try:
-            return _epoch(datetime.strptime(text, fmt))
+            return _epoch_ms(datetime.strptime(text, fmt))
         except ValueError:
             continue
     return 0
+
+
+def text_or_none(value: object) -> Optional[str]:
+    """
+    Review text theo contract: giữ nguyên nội dung nguồn (không strip, không sửa Unicode).
+    Thiếu hoặc chỉ toàn khoảng trắng thì None.
+    """
+    if is_missing(value) or not isinstance(value, str):
+        return None
+    return value if value.strip() else None
 
 
 def parse_list(val: object) -> List[str]:

@@ -12,7 +12,6 @@ import pyarrow.parquet as pq
 from src.contracts.dto import InteractionRecord
 from src.contracts.exceptions import DataValidationError, EmptyDatasetError
 from src.contracts.interfaces import BaseDataLoader
-from src.data.dataset import InteractionDataset
 from src.data.entities import GameItem, GameStats, make_game
 from src.data.parsing import (
     as_recommended,
@@ -20,10 +19,11 @@ from src.data.parsing import (
     is_missing,
     label_from_recommended,
     label_from_rating,
+    text_or_none,
     to_timestamp,
 )
 
-Catalog = Tuple[Dict[str, GameItem], Dict[str, GameStats]]
+Catalog = Tuple[Dict[str, GameItem], Dict[str, GameStats]]  # (GameItem, GameStats)
 
 
 def _require_source_path(source_path: str) -> Path:
@@ -85,13 +85,18 @@ def read_games_json(path: Path) -> Dict[str, GameItem]:
 
 class ParquetDataLoader(BaseDataLoader):
     """
-    Đọc catalog và tương tác đã xử lý.
+    Đọc catalog và tương tác đã xử lý thành DTO của contract.
 
     load_games: games.parquet hoặc games.json -> dict[str, GameItem] (dto của contract).
     load_interactions: interactions.parquet, hoặc CSV phẳng có user_id và game_id/item_id.
-    Nhãn rating nhị phân: cột rating (đã 0/1) nếu có, không thì Recommended=1.0, Not Recommended=0.0.
-    Timestamp lấy từ cột timestamp/post_date (số hoặc ngày), thiếu thì 0.
+      Nhãn rating nhị phân: cột rating (đã 0/1) nếu có, không thì Recommended=1.0, Not Recommended=0.0.
+      Timestamp (cột timestamp/post_date) về Unix mili giây, thiếu thì 0.
+      Cột text/review (nếu có) vào InteractionRecord.text, giữ nguyên nội dung; thiếu hoặc trống là None.
+    Sau mỗi lần load_interactions, `load_stats` ghi số dòng đọc và số dòng bị loại theo từng lý do.
     """
+
+    def __init__(self) -> None:
+        self.load_stats: Dict[str, int] = {}
 
     def load_games(self, source_path: str) -> Dict[str, GameItem]:
         return self._load_catalog(source_path)[0]
@@ -99,72 +104,62 @@ class ParquetDataLoader(BaseDataLoader):
     def load_game_stats(self, source_path: str) -> Dict[str, GameStats]:
         return self._load_catalog(source_path)[1]
 
+    def load_catalog(self, source_path: str) -> Catalog:
+        """(GameItem của contract, GameStats) trong một lần đọc file."""
+        return self._load_catalog(source_path)
+
     def load_interactions(self, source_path: str) -> List[InteractionRecord]:
         path = _require_source_path(source_path)
         if not path.is_file():
             raise DataValidationError(f"Không tìm thấy file tương tác: {source_path}")
+        self.load_stats = {
+            "rows_read": 0,
+            "rows_skipped_missing_id": 0,
+            "rows_skipped_bad_label": 0,
+            "rows_with_text": 0,
+            "text_column_present": 0,
+        }
         if path.suffix.lower() == ".csv":
             records = self._load_interactions_csv(path)
         else:
             records = self._load_interactions_parquet(path)
+        self.load_stats["rows_kept"] = len(records)
         if not records:
             raise EmptyDatasetError(f"Không có tương tác hợp lệ trong {source_path}.")
         return records
 
-    def load_dataset(
+    def load_review_texts(
         self,
-        games_path: str,
-        interactions_path: str,
-        reviews_path: Optional[str] = None,
-    ) -> InteractionDataset:
-        games, stats = self._load_catalog(games_path)
-        dataset = InteractionDataset(
-            self.load_interactions(interactions_path),
-            games,
-            game_stats=stats,
-        )
-        if reviews_path:
-            self.load_reviews(dataset, reviews_path)
-        return dataset
-
-    def load_reviews(
-        self,
-        dataset: InteractionDataset,
         reviews_path: str,
         user_col: str = "user_id",
         game_col: str = "game_id",
         review_col: str = "review",
         chunksize: int = 200_000,
-    ) -> int:
+    ) -> Tuple[Dict[Tuple[str, str], str], Dict[str, int]]:
         """
-        Stream reviews.csv và gắn vào dataset. Trả về số review đã gắn.
-        Chỉ cặp (user, game) đã có tương tác mới nhận review. Gọi trước dataset.split().
+        Đọc file review rời (CSV: user, game, review) thành {(user_id, game_id): text}.
+        Dùng khi nguồn interactions chưa có cột text. Cặp lặp thì giữ dòng đầu tiên.
+        Nội dung text giữ nguyên; dòng trống bị bỏ và đếm trong stats.
         """
         path = _require_source_path(reviews_path)
-        if not isinstance(dataset, InteractionDataset):
-            raise DataValidationError("dataset phải là InteractionDataset.")
         try:
             header = list(pd.read_csv(path, nrows=0).columns)
         except Exception as exc:
             raise DataValidationError(f"Không thể đọc file CSV review: {exc}") from exc
 
         if user_col not in header:
-            for alternate in ("user_id", "user"):
-                if alternate in header:
-                    user_col = alternate
-                    break
+            user_col = next((c for c in ("user_id", "user") if c in header), user_col)
         if game_col not in header:
-            for alternate in ("game_id", "item_id"):
-                if alternate in header:
-                    game_col = alternate
-                    break
-
+            game_col = next((c for c in ("game_id", "item_id") if c in header), game_col)
+        if review_col not in header:
+            review_col = next((c for c in ("review", "text") if c in header), review_col)
         wanted = [user_col, game_col, review_col]
         missing = [column for column in wanted if column not in header]
         if missing:
             raise DataValidationError(f"File review thiếu cột {missing}. Các cột hiện có: {header}")
 
-        total = 0
+        texts: Dict[Tuple[str, str], str] = {}
+        stats = {"rows_read": 0, "rows_blank_text": 0, "rows_duplicate_pair": 0}
         try:
             reader = pd.read_csv(
                 path,
@@ -176,16 +171,24 @@ class ParquetDataLoader(BaseDataLoader):
                 encoding_errors="replace",
             )
             for chunk in reader:
-                total += dataset.add_reviews_batch(
-                    chunk[user_col].tolist(),
-                    chunk[game_col].tolist(),
-                    chunk[review_col].tolist(),
-                )
+                for user, game, review in zip(
+                    chunk[user_col].tolist(), chunk[game_col].tolist(), chunk[review_col].tolist()
+                ):
+                    stats["rows_read"] += 1
+                    text = text_or_none(review)
+                    if text is None:
+                        stats["rows_blank_text"] += 1
+                        continue
+                    key = (clean_id(user), clean_id(game))
+                    if key in texts:
+                        stats["rows_duplicate_pair"] += 1
+                        continue
+                    texts[key] = text
         except DataValidationError:
             raise
         except Exception as exc:
             raise DataValidationError(f"Không thể tải review từ CSV: {exc}") from exc
-        return total
+        return texts, stats
 
     # ----------------------------------------------------------------- catalog
 
@@ -304,10 +307,13 @@ class ParquetDataLoader(BaseDataLoader):
         timestamp_col = _pick_column(names, ("timestamp", "post_date"))
         if timestamp_col:
             mapping["timestamp"] = timestamp_col
+        text_col = _pick_column(names, ("text", "review"))
+        if text_col:
+            mapping["text"] = text_col
         return mapping
 
-    @staticmethod
     def _records_from_columns(
+        self,
         payload: Dict[str, List[object]],
         columns: Dict[str, str],
     ) -> List[InteractionRecord]:
@@ -316,25 +322,33 @@ class ParquetDataLoader(BaseDataLoader):
         ratings = payload.get(columns["rating"]) if "rating" in columns else None
         recommended = payload.get(columns["recommended"]) if "recommended" in columns else None
         timestamps = payload.get(columns["timestamp"]) if "timestamp" in columns else None
+        texts = payload.get(columns["text"]) if "text" in columns else None
+        stats = self.load_stats
+        stats["text_column_present"] = int(texts is not None)
 
         records: List[InteractionRecord] = []
         for index, (user_id, item_id) in enumerate(zip(users, items)):
+            stats["rows_read"] += 1
             user_key = clean_id(user_id)
             item_key = clean_id(item_id)
             if not user_key or not item_key:
+                stats["rows_skipped_missing_id"] += 1
                 continue
 
             label: Optional[float] = None
             if ratings is not None and not is_missing(ratings[index]) and str(ratings[index]).strip() != "":
                 label = label_from_rating(ratings[index])
-            if label is None:
-                if recommended is None:
-                    continue
+            if label is None and recommended is not None:
                 flag = as_recommended(recommended[index])
-                if flag is None:
-                    continue
-                label = label_from_recommended(flag)
+                if flag is not None:
+                    label = label_from_recommended(flag)
+            if label is None:
+                stats["rows_skipped_bad_label"] += 1
+                continue
 
+            text = text_or_none(texts[index]) if texts is not None else None
+            if text is not None:
+                stats["rows_with_text"] += 1
             timestamp = to_timestamp(timestamps[index]) if timestamps is not None else 0
             records.append(
                 InteractionRecord(
@@ -342,6 +356,7 @@ class ParquetDataLoader(BaseDataLoader):
                     item_id=item_key,
                     rating=label,
                     timestamp=timestamp,
+                    text=text,
                 )
             )
         return records
