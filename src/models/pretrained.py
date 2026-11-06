@@ -28,7 +28,7 @@ class PretrainedRecommender:
         obj._users = {u: i for i, u in enumerate(info['user_ids'])}
         obj._items = tuple(info['item_ids'])
         obj._item_map = {item: i for i, item in enumerate(obj._items)}
-        obj._catalog = info['catalog']
+        obj._catalog = cls._validate_catalog(info.get("catalog"))
         obj.model_name = obj._model.source
         obj.allow_cold_start_fallback = allow_cold_start_fallback
         obj._catalog_lookup = catalog_lookup
@@ -39,6 +39,47 @@ class PretrainedRecommender:
         # load_bundle validates and sorts unique (user,item) pairs. Keep the array
         # instead of building over a million Python sets at application startup.
         return obj
+
+    @staticmethod
+    def _validate_catalog(catalog):
+        if not isinstance(catalog, dict):
+            raise DataValidationError(
+                "catalog must be a JSON object containing game metadata"
+            )
+
+        for game_id, row in catalog.items():
+            if not isinstance(game_id, str) or not game_id.strip():
+                raise DataValidationError(
+                    "catalog keys must be nonempty game ID strings"
+                )
+
+            if not isinstance(row, dict):
+                raise DataValidationError(
+                    f"catalog entry {game_id!r} must be a JSON object"
+                )
+
+            for field in ("title", "image_url"):
+                value = row.get(field)
+                if value is not None and not isinstance(value, str):
+                    raise DataValidationError(
+                        f"catalog[{game_id!r}].{field} must be a string or null"
+                    )
+
+            title = row.get("title")
+            if isinstance(title, str) and title and not title.strip():
+                raise DataValidationError(
+                    f"catalog[{game_id!r}].title cannot contain only whitespace"
+                )
+
+            categories = row.get("categories", [])
+            if not isinstance(categories, list) or any(
+                not isinstance(category, str) for category in categories
+            ):
+                raise DataValidationError(
+                    f"catalog[{game_id!r}].categories must be a list of strings"
+                )
+
+        return catalog
 
     @staticmethod
     def _raw_id(value):
