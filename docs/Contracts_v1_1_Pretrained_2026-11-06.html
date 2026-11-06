@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Contracts v1.1: dùng lại weights Kaggle 70/15/15, giữ Data branch trên GitHub, tích hợp CPU inference không retrain.">
+<title>Contracts v1.1 — Tích hợp model đã train</title>
+<style>
+:root{color-scheme:light}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:#fff;color:#222b33;font:17px/1.65 "Segoe UI",Arial,sans-serif}
+main{max-width:1080px;margin:0 auto;padding:48px 42px 64px}
+h1,h2,h3{color:#111;line-height:1.3}
+h1{font-size:36px;margin:14px 0 20px}
+h2{font-size:26px;margin:0 0 22px}
+h3{font-size:19px;margin:28px 0 10px}
+p{margin:12px 0}
+.eyebrow{font-size:14px;color:#53616c}
+.lead{font-size:19px}
+.status{color:#5d4b29;font-size:15px}
+nav{display:grid;grid-template-columns:1fr 1fr;gap:9px 24px;padding:24px 0;margin:30px 0 44px;border-top:1px solid #d9dfe3;border-bottom:1px solid #d9dfe3}
+a{color:#155a95;text-underline-offset:3px;overflow-wrap:anywhere}
+section{margin:0 0 52px;scroll-margin-top:22px}
+.table-wrap{overflow-x:auto;margin:20px 0}
+table{border-collapse:collapse;width:100%;font-size:15px;line-height:1.5}
+th,td{border:1px solid #d5dce0;text-align:left;vertical-align:top;padding:12px 14px}
+th{background:#e9f0f5;color:#172b3a}
+tbody tr:nth-child(even){background:#fafbfd}
+code{font:0.89em/1.5 Consolas,"Courier New",monospace;background:#f2f5f7;padding:1px 4px;border-radius:3px;overflow-wrap:anywhere}
+pre{font-size:15px;line-height:1.55;background:#f6f8fa;border:1px solid #e1e6ea;border-radius:5px;padding:16px 18px;overflow-x:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+pre code{background:none;padding:0;font:inherit}
+ul,ol{padding-left:26px}
+li{margin:8px 0}
+footer{border-top:1px solid #d9dfe3;padding-top:22px;font-size:14px;color:#56636d}
+@media(max-width:650px){main{padding:25px 18px}body{font-size:16px}h1{font-size:29px}h2{font-size:23px}nav{grid-template-columns:1fr}table{font-size:13px}th,td{padding:9px 8px}pre{font-size:13px;padding:12px}}
+@media print{body{font:11pt/1.5 "Segoe UI",Arial,sans-serif}main{max-width:none;padding:0}h1{font-size:24pt}h2{font-size:18pt}h3{font-size:13pt}nav{display:none}section{margin-bottom:24pt}h2,h3{break-after:avoid}thead{display:table-header-group}tr{break-inside:avoid}table{font-size:9pt}.table-wrap{overflow:visible}pre{font-size:9pt;white-space:pre-wrap}a{color:#174d78}footer{font-size:9pt}}
+</style>
+</head>
+<body><main>
+<header>
+<p class="eyebrow">Đồ án OOP · Hệ thống đề xuất game · 06/11/2026</p>
+<h1>Contracts v1.1 — Tích hợp model đã train</h1>
+<p class="status"><strong>Phạm vi:</strong> Bản sửa theo yêu cầu của thành viên Model để bàn giao ứng dụng dùng lại weights đã train. Thay các yêu cầu triển khai hiện tại của v1 ngày 05/11/2026; không khẳng định cả nhóm đã merge code hoặc xác nhận bản sửa này.</p>
+<p class="lead">Mục tiêu hiện tại: tải model có sẵn → kiểm tra checksum → load một lần trên CPU → backend trả đề xuất → UI hiển thị. <strong>Không bắt buộc retrain, chia lại dữ liệu, tạo lại mapping hoặc encode lại review để hoàn thành luồng này.</strong></p>
+<p>Data lấy theo <a href="https://github.com/quangminh23082007-hash/project_oop_25tnt1_messi_group/blob/c70e4f4ff5fed932c14adfeea1ad58ca7d29907c/src/data_layer.py">nhánh data trên GitHub, commit c70e4f4f</a>. Không dùng các prototype Data chưa commit trong thư mục local làm chuẩn. Metadata của chính bundle và báo cáo đã lưu là bằng chứng cho lần train cũ; code Data hiện tại không tự chứng minh dữ liệu đã train giống hệt một lần xuất dữ liệu mới.</p>
+<p><a href="TRAINED_RUN_REFERENCE.json">Metadata và validation của lần train được chấp nhận</a> · <a href="PRETRAINED_MODELS.md">Cách đóng gói, tải và load</a> · <a href="Contracts_v1_Game_Recommender_2026-11-05.html">V1 lưu để đối chiếu</a></p>
+</header>
+<nav aria-label="Mục lục">
+<a href="#scope">1. Điều gì thay đổi</a><a href="#trained">2. Run và weights được chấp nhận</a>
+<a href="#data">3. Data: giữ API đang có</a><a href="#ids">4. ID, mapping và lịch sử</a>
+<a href="#model">5. Model và khởi động</a><a href="#service">6. Service và UI</a>
+<a href="#evaluation">7. Evaluation và báo cáo</a><a href="#future">8. Khi nào cần train lại</a>
+<a href="#owners">9. Phân công tối thiểu</a><a href="#acceptance">10. Điều kiện hoàn thành</a>
+</nav>
+<section id="scope"><h2>1. Điều gì thay đổi so với v1</h2>
+<ul>
+<li>80/10/10 per-user và mapping từ mọi train interaction không còn là điều kiện để dùng weights hiện có. Run hiện tại được chấp nhận với protocol đã lưu ở mục 2.</li>
+<li>Không bắt Data phải đổi toàn bộ sang InteractionDataset, tạo ba DatasetSplits hoặc xuất bộ JSONL v1 chỉ để chạy UI bằng weights có sẵn.</li>
+<li>Không gọi fit/train khi khởi động ứng dụng; dùng inference loader đã chuẩn bị.</li>
+<li>Không bắt chạy lại encoder, optimizer, chọn epoch hay benchmark để cấp quyền dùng bundle.</li>
+<li>API huấn luyện v1, các lớp và test đã viết có thể giữ nguyên cho công việc sau. Chúng không phải đường bắt buộc của bản bàn giao dùng model có sẵn.</li>
+<li>Vẫn bắt buộc giữ mapping đúng, kiểm tra tính toàn vẹn, lọc lịch sử, báo fallback đúng, giữ provenance trung thực và xử lý lỗi. Đổi contract không sửa hoặc nâng độ tin cậy của các metric đã đo.</li>
+</ul></section>
+<section id="trained"><h2>2. Run và weights được chấp nhận</h2>
+<p>Run: <code>full_70_15_15_v1</code>. Hai bundle <code>bpr/cpu</code> và <code>text_bpr/cpu</code>, <code>format_version=3</code>, <code>representation=compact</code>. Mỗi bundle chứa 1.394.194 user và 23.089 game theo thứ tự ID gốc đã lưu, 64 latent factors.</p>
+<h3>Protocol đã dùng</h3>
+<ul>
+<li>Nhãn từ recommended: positive = 1, negative = 0; không dùng Wilson score hoặc điểm 1–5 làm nhãn BPR.</li>
+<li>Seed 42; deterministic random <strong>pair split</strong>, không phải per-user split và không phải temporal split. Với hash draw cho (seed, user, game): &lt;0,70 là train; từ 0,70 đến &lt;0,85 là validation; phần còn lại là test. Tỷ lệ là ngưỡng phân bổ; số dòng thực tế sau lọc không bắt buộc đúng 70/15/15.</li>
+<li>Mapping của run đến từ train-positive core được lọc lặp với min_user=3, min_item=2, rồi sắp ID như pipeline đã lưu. <strong>Không dựng lại mapping từ Dataset của Data rồi gán vào weights.</strong></li>
+<li>Negative sampling chọn item chưa quan sát trong catalog train; cả positive và negative train đều được chặn. Validation lọc train history; test dùng lịch sử theo artifacts/protocol của lần chạy gốc.</li>
+<li>Adam, learning_rate=0,001, reg=0,01, batch size tổng 1024, tối đa 30 epoch, patience=5. BPR chạy DDP 2 GPU và chọn epoch 18; TextBPR train trên 1 GPU và chọn epoch 30. Không thay bằng NumPy SGD rồi gọi đó là tái lập y hệt.</li>
+<li>TextBPR dùng frozen Qwen/Qwen3-Embedding-4B, revision <code>5cf2132abc99cad020ac570b19d031efec650f2b</code>, 2560 chiều, tối đa 256 token/review; tối đa 4 review/item trong thứ tự train-review đã chuẩn bị. Metadata ghi 92.347 review đã encode. Item vector là mean của review vectors chuẩn hóa rồi chuẩn hóa L2. Hai GPU được dùng cho encoding độc lập.</li>
+<li>Compact TextBPR đã gộp item factors <code>R = Q + X @ W.T</code>; serving chỉ tính <code>P[user] @ R[item]</code>. Không cần Qwen hoặc GPU trên laptop để chấm các game đã có trong bundle.</li>
+</ul>
+<p>Giữ nguyên <code>data_fingerprint</code> và <code>weights_sha256</code> trong model_info.json. Chi tiết encoder, cấu hình, checksum và validation lưu ở TRAINED_RUN_REFERENCE.json. Không tạo giả mapping_fingerprint/train_fingerprint/review_fingerprint của v1 cho run cũ.</p>
+<h3>Giới hạn phải giữ trong báo cáo</h3>
+<p>Run cho phép user ID chưa được xác minh, có thể là display name. Kết quả là đánh giá exploratory trong tập người dùng/catalog đủ điều kiện, không chứng minh tài khoản thật hoặc khả năng dự đoán tương lai. Các positive ngoài mapping đã bị loại theo protocol gốc; không gọi đây là đánh giá toàn bộ catalog hoặc chính sách loại-user của v1.</p>
+</section>
+<section id="data"><h2>3. Data: giữ API đang có trên GitHub</h2>
+<p>Giữ <code>src/data_layer.py</code>, các lớp <code>Dataset</code>, <code>Game</code>, <code>Interaction</code>, <code>ParquetDatasetRepository</code> và parser của nhánh data. Không yêu cầu rename num_games thành num_items ở mọi nơi để chạy inference.</p>
+<ul>
+<li><code>games.parquet</code>: game_id, name, price, genres, positive, negative, tags theo schema đang có.</li>
+<li><code>interactions.parquet</code>: user_id, game_id, recommended, playtime, helpfulness theo schema đang có.</li>
+<li><code>reviews.csv</code>: user_id (hoặc user theo cấu hình reader), game_id, review. Đủ cho nguồn đầu vào của pipeline legacy khi cần; không tự xem đây là review train đã tách.</li>
+<li><code>Dataset.get_game(raw_game_id)</code> và <code>Dataset.games</code> là nguồn catalog; các mapping user2id/game2id của Data chỉ phục vụ Data, không thay mapping trong model.</li>
+</ul>
+<p><strong>Chạy inference không cần tải toàn bộ interactions/reviews vào RAM.</strong> Catalog tối thiểu đã có trong bundle; chỉ đọc catalog Data nếu cần thông tin mới hoặc filter. Tên game/ảnh lấy từ bundle khi chưa có catalog bổ sung.</p>
+<p>Adapter tại biên chuyển <code>Game.game_id → GameItem.item_id</code>, <code>Game.name → GameItem.title</code>, genres thành tuple và bổ sung developer nếu có. Không sửa số thứ tự hàng của weights. Game chỉ có trong catalog mới nhưng chưa có trong bundle không được tự thêm vào danh sách chấm điểm.</p>
+<p>Data hiện gộp giá thiếu về 0.0. Vì vậy không thể suy ra 0 là miễn phí nếu không còn bằng chứng từ nguồn. Chỉ bật lọc giá sau khi cung cấp giá tin cậy/cờ giá thiếu; giá chưa rõ trả None. Đây là sửa metadata nhỏ, không cần retrain. Categories trong bundle không tự được đổi tên thành genres; nguồn ảnh hiện có là image_url trong bundle hoặc nguồn UI riêng.</p>
+<p>Không dùng <code>train_test_split()</code> hai tập hoặc chế độ rating_weighted mặc định của Data để tái tạo run đã chấp nhận. Chúng có thể tồn tại cho mục đích khác, nhưng không được dùng để thay đổi bundle hoặc gán metric mới cho nó.</p>
+</section>
+<section id="ids"><h2>4. ID, mapping và lịch sử</h2>
+<ul>
+<li>ID gốc giữ dạng string. Đổi sang chỉ số chỉ bằng user_ids/item_ids trong model_info.json.</li>
+<li>Lịch sử huấn luyện trong weights được dùng để loại game đã review positive lẫn negative. Backend bổ sung lịch sử mới của app qua extra_seen bằng game ID gốc.</li>
+<li>Tài khoản app dùng namespace riêng. Không ghép tài khoản app với user dataset bằng tên hiển thị. Chỉ dùng profile dataset khi có liên kết nguồn đáng tin cậy hoặc trong demo được ghi rõ.</li>
+<li>User không có profile: mặc định báo UnknownUserError; có thể bật popularity fallback rõ ràng. Fallback cũng phải lọc lịch sử app, trả is_fallback=True và model_name=Popularity.</li>
+<li>Không mượn user 0 cho user lạ. Đăng nhập không làm weights học một user mới; cá nhân hóa user mới là việc riêng ngoài phạm vi bản bàn giao này.</li>
+</ul></section>
+<section id="model"><h2>5. Model và khởi động</h2>
+<p>Đường chạy bắt buộc cho bản bàn giao hiện tại:</p>
+<pre><code>from src.models.pretrained import PretrainedRecommender
+
+recommender = PretrainedRecommender.load(
+    "artifacts/models/bpr/cpu",
+    allow_cold_start_fallback=True,  # lựa chọn rõ của ứng dụng
+    catalog_lookup=None,            # hoặc adapter catalog trả GameItem
+)</code></pre>
+<p>Load một lần khi backend khởi động; tái sử dụng cho nhiều request. Không gọi Service.train, model.fit hoặc build_item_features để load bundle. Không tạo Dataset giả để qua kiểm tra của BaseRecommender.</p>
+<p>Model được phân phối bằng private GitHub Release gồm ZIP weights + model_info.json và manifest checksum. Installer kiểm tra cả ZIP lẫn weights bên trong trước khi kích hoạt. Không ghi đè model đang có một cách âm thầm; không đổi repo thành public để tải thuận tiện.</p>
+<p>Giữ <code>src/models/_array</code> và thuật toán gốc; loader inference là adapter nhỏ tại <code>src/models/pretrained.py</code>. Public training models v1 và tests của chúng có thể giữ nguyên, nhưng không phải kiểu bắt buộc cho loader inference-only.</p>
+<p>BPR là lựa chọn mặc định theo validation NDCG@10 đã lưu. TextBPR là bundle thay thế; đổi lựa chọn bằng model path và tải lại backend, không đổi cấu trúc file hoặc train lại.</p>
+</section>
+<section id="service"><h2>6. Service và UI</h2>
+<p>Service có thể thêm factory <code>load_pretrained(...)</code> chuyển tiếp đến loader hoặc backend dùng loader trực tiếp. Không cần sửa toàn bộ Service.train/evaluator API trước khi hoàn thành đường inference. Không gán trực tiếp weights vào model đang gắn một Dataset khác.</p>
+<pre><code>recommend_games(raw_user_id, top_k=10, exclude_played=True,
+                genre_filter=None, max_price=None, *, extra_seen=())
+    -&gt; list[RecommendationResult]
+get_game_details(raw_game_id) -&gt; GameItem
+get_catalog_metadata(raw_game_id) -&gt; dict
+get_user_played_games(raw_user_id) -&gt; list[GameItem]</code></pre>
+<p>Kiểu công khai ở biên chỉ cần thống nhất GameItem, RecommendationResult và các exception dùng trong serving. Data có thể giữ Game/Dataset nội bộ; Evaluation có thể giữ core nội bộ. Không tạo thêm một lớp RecommendationResult khác có cùng tên. Dùng keyword khi tạo DTO để tránh lệch thứ tự field.</p>
+<pre><code>RecommendationResult:
+    rank, game_id, title, genres, predicted_score,
+    price, developer, model_name, is_fallback</code></pre>
+<ul>
+<li>game_id là ID gốc; predicted_score là điểm xếp hạng, không phải sao hoặc xác suất.</li>
+<li>Sort score giảm dần, hòa điểm theo internal item ID đã lưu tăng dần; không làm tròn trước khi sort.</li>
+<li>exclude_played=True lọc lịch sử train và lịch sử app. Tắt cờ này nghĩa là cho phép hiện lại lịch sử.</li>
+<li>Filter giá/genre lấy từ catalog đáng tin cậy. Không đủ game hợp lệ thì trả ít hơn K hoặc []; không lấp bằng game sai điều kiện.</li>
+<li>Metadata ảnh được nối vào JSON cho UI bằng game_id; không bắt đổi RecommendationResult chỉ để chứa image_url.</li>
+<li>Bundle hỏng/thiếu: báo lỗi khởi động dễ hiểu, không báo ready và không tự train để che lỗi. Thay model chỉ được công bố sau khi bundle mới load thành công.</li>
+</ul>
+<p>Cùng weights, metadata, source user, candidate set, K và filter phải cho cùng thứ tự đề xuất trên cùng môi trường; khác BLAS/hardware có thể sai số dấu phẩy động nhỏ. Đổi catalog filter hoặc lịch sử app có thể đổi danh sách hiển thị dù weights không thay đổi.</p>
+</section>
+<section id="evaluation"><h2>7. Evaluation và báo cáo</h2>
+<p>Chấp nhận báo cáo của run gốc với nhãn protocol rõ ràng. Không cần huấn luyện lại để hoàn thành demo. Giữ các file validation.json đã lưu; metadata của từng bundle là nguồn chính cho epoch/backend/features, vì run_config ban đầu có thể chưa phản ánh các cell chạy thêm sau đó.</p>
+<ul>
+<li>Cùng sample 2.000 validation users, seed 42; catalog 23.089 game; K=10; eligible validation users được báo là 709.758. Không gọi số này là đánh giá trên toàn bộ 1.394.194 user.</li>
+<li>BPR: best_epoch=18, Recall@10=0.09029426316210223, NDCG@10=0.05779440398903863.</li>
+<li>TextBPR: best_epoch=30, Recall@10=0.09488625535291857, NDCG@10=0.05561385771797365.</li>
+<li>Popularity: Recall@10=0.06051108005339922, NDCG@10=0.036662110755724085.</li>
+<li>Đây là validation, không phải kết quả test. Không đổi tên thành test hoặc so trực tiếp với metric từ split/candidates/users khác.</li>
+</ul>
+<p>Nếu cần chấm lại: dùng đúng prepared artifacts, mappings và targets/seen của run gốc trong archive; loader compact không tự chứa toàn bộ ground truth validation/test. Giữ chính sách candidates và sample cũ khi muốn đối chiếu. Không chia mới data branch 70/15/15 rồi gọi đó là cùng test set.</p>
+<p>Evaluation teammate có thể giữ evaluator hiện tại và thêm adapter riêng cho legacy nếu cần benchmark tương tác; không bắt chuyển toàn bộ core sang BaseEvaluator v1 để UI hoạt động. Không đưa DTO Interaction của layer khác vào chỗ đang kiểm tra strict isinstance mà chưa chuyển đổi rõ ràng.</p>
+<p>Chính sách loại positive ngoài mapping của run cũ được ghi nguyên trạng; nếu team sửa để giảm bias, báo đó là protocol/experiment mới. Không dùng việc đổi contract để hợp thức hóa leakage hoặc sửa số đo.</p>
+</section>
+<section id="future"><h2>8. Khi nào cần train lại</h2>
+<p>Không cần retrain khi: load bundle trên laptop, đóng gói/phát hành weights, đổi UI, thêm ảnh/catalog metadata, sửa adapter tên field, lọc lịch sử app hoặc bật popularity fallback.</p>
+<p>Có thể cần retrain hoặc một workflow model mới khi: đổi train records/split membership/mapping, đổi labels, thay encoder/features, đổi model hyperparameters, muốn học user/game mới hoặc muốn báo cáo theo protocol khác.</p>
+<p>Nếu cần tái lập run: dùng đúng input/prepared checksum và code snapshot gốc, ratio/hash policy/mapping/core/optimizer/feature cap/epoch-selection đã lưu. Tỷ lệ 70/15/15 và seed giống nhau chưa đủ đảm bảo weights giống nhau; CUDA/DDP có sai khác số học. Không có yêu cầu tái lập byte-for-byte để chạy demo.</p>
+<p>Yêu cầu train-only reviews và không dùng test để chọn model vẫn áp dụng cho mọi lần train mới. Các quy định nâng cấp từ v1 có thể dùng trong một experiment riêng, không tự thay đổi provenance của weights đã train.</p>
+</section>
+<section id="owners"><h2>9. Phân công tối thiểu để hoàn thành</h2>
+<ol>
+<li><strong>Model:</strong> commit loader/installer/manifest; publish hai ZIP đã kiểm tra; giữ weights và metadata nguyên bản; cung cấp lệnh chạy CPU và báo cáo gốc.</li>
+<li><strong>Data:</strong> giữ API/file formats của nhánh data; bàn giao catalog theo raw game_id; cung cấp giá/genre đáng tin cậy nếu bật filter. Không rebuild mapping phục vụ weights. Review exports và sửa duplicate/split toàn diện chỉ cần cho lần train mới, không chặn demo dùng bundle.</li>
+<li><strong>Evaluation:</strong> trình bày validation gốc với đúng sample/protocol và giới hạn; chạy kiểm tra load/ranking; nếu benchmark lại thì dùng artifacts gốc qua adapter, không cần retrain.</li>
+<li><strong>Service/UI:</strong> thêm startup load/factory; trả JSON từ RecommendationResult; nối catalog và lịch sử app; xử lý fallback, loading và lỗi. Cung cấp code UI/endpoint thực tế để test.</li>
+<li><strong>Tích hợp:</strong> thống nhất các DTO serving, đóng gói dependencies và một lệnh startup; giữ source trên branch phù hợp; kiểm tra fresh clone trên máy không GPU. Không bắt merge mọi prototype local để đủ thư mục.</li>
+</ol></section>
+<section id="acceptance"><h2>10. Điều kiện hoàn thành bản dùng weights có sẵn</h2>
+<ol>
+<li>Teammate có quyền repo tải source và private Release, verify checksum và cài model không retrain.</li>
+<li>Ứng dụng load BPR hoặc TextBPR một lần trên CPU và UI nhận kết quả thật từ backend.</li>
+<li>Known source user cho ranking hợp lệ; unknown app user theo policy đã chọn; fallback được ghi đúng.</li>
+<li>Loại game đã review cả positive/negative và lịch sử app; filters không lấy nhầm ID hay xem giá thiếu là miễn phí.</li>
+<li>Không rebuild/sort lại ID mapping theo Data branch; bundle hỏng bị từ chối.</li>
+<li>Không download Qwen, không yêu cầu GPU hoặc dữ liệu review đầy đủ khi serving.</li>
+<li>Báo cáo nêu đúng run/protocol/sample và giới hạn identity; không gắn metric validation thành test.</li>
+</ol>
+<p>Việc cập nhật tài liệu này không tự publish weights, push code hay hoàn thiện UI. Những bước phân phối/tích hợp còn lại vẫn phải thực hiện và kiểm tra.</p>
+</section>
+<footer><p>Contracts v1.1 · 06/11/2026 · Thay đổi phạm vi triển khai để dùng lại trained bundles. Không thay weights, thuật toán, checksum hoặc kết quả đã đo. Data tham chiếu từ GitHub c70e4f4f; v1 lưu để đối chiếu.</p></footer>
+</main></body></html>

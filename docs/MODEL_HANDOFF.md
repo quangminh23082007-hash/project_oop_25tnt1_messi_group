@@ -1,6 +1,14 @@
-# Models branch handoff — Contracts v1 (2026-11-05)
+# Models branch handoff — retained v1 training API
 
-Source of truth: [team contract](Contracts_v1_Game_Recommender_2026-11-05.html).
+**Current delivery uses [Contracts v1.1](Contracts_v1_1_Pretrained_2026-11-06.html).**
+Use the existing trained bundles through the installer and inference loader.
+The Data reference is the GitHub `data` branch at `c70e4f4f`; its existing internal
+classes/file formats may remain for this delivery. No full Data/Evaluation v1
+rewrite, new split or retraining is required to serve the saved weights.
+See [PRETRAINED_MODELS.md](PRETRAINED_MODELS.md) for the current path.
+
+The remainder documents the optional training API implemented against the
+[archived v1 design](Contracts_v1_Game_Recommender_2026-11-05.html).
 This contribution implements the Model boundary and proposes the shared v1
 records/interfaces it imports. The team should use these same shared definitions;
 Data, Evaluation and Service must import/re-export them, not define duplicates.
@@ -142,10 +150,11 @@ Kaggle notebook/CLI used an earlier preparation/mapping protocol (including the
 path, but are NOT evidence of an experiment under the new v1 protocol. Do not fake
 new fingerprints or claim those weights were trained on the new splits.
 
-Retrain a fresh v1 experiment after the Data handoff is ready and the notebook
-uses the new splits/features and public validation interface. Porting the legacy
-GPU launcher/export to the v1 experiment protocol is a separate integration step;
-changing a notebook split percentage alone does not complete it.
+Only if the team later chooses a new v1 training experiment, prepare its Data
+handoff and adapt the notebook's splits/features and public validation interface.
+That work is not required for the v1.1 pretrained delivery. Porting the legacy GPU
+launcher/export remains a separate step; changing a split percentage alone does
+not reproduce an existing experiment.
 
 ## Verification before push
 
