@@ -1,127 +1,140 @@
-"""
-Abstract Base Classes defining strict boundaries between the 4 team members.
-
-Design Justifications:
-- Abstraction: Defines clean, minimal, non-leaky contracts for DataLoader, Recommender, and Metric.
-- Template Method Pattern (BaseRecommender.fit): High-level invariant checks (dataset validation,
-  dimension caching, fitted flag transition) are controlled by the abstract base class, while
-  algorithmic logic is deferred to polymorphic `_fit_internal()` subclasses.
-- Open-Closed Principle: New algorithms or evaluation metrics can be added without modifying
-  existing interfaces or consumer services.
-"""
-
+"""Public boundaries from Contracts v1; no dependency on a Data implementation."""
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Sequence, Set, TYPE_CHECKING
+from numbers import Integral
+from typing import Iterable, Optional, Sequence, Set, Protocol
 import numpy as np
+from .dto import GameItem, Interaction, InteractionRecord, ReviewRecord, ScoredItem
+from .exceptions import DataValidationError, InvalidParameterError, ModelNotFittedError
 
-from src.contracts.dto import InteractionRecord, ScoredItem
-from src.contracts.exceptions import (
-    EmptyDatasetError,
-    InvalidParameterError,
-    ModelNotFittedError,
-)
 
-if TYPE_CHECKING:
-    from src.data.dataset import InteractionDataset
-    from src.data.entities import GameItem
+class IdMapper(Protocol):
+    size: int
+    def contains_raw(self, raw_id: str) -> bool: ...
+    def to_idx(self, raw_id: str) -> int: ...
+    def to_raw(self, index: int) -> str: ...
+
+
+class InteractionDataset(Protocol):
+    split_name: str
+    interactions: Sequence[Interaction]
+    num_interactions: int
+    num_users: int
+    num_items: int
+    user_mapper: IdMapper
+    item_mapper: IdMapper
+    mapping_fingerprint: str
+    fingerprint: str
+    review_fingerprint: str
+    def get_game_by_raw_id(self, raw_game_id: str) -> GameItem: ...
+    def get_user_seen_items(self, user_id: int) -> frozenset[int]: ...
+    def get_user_positive_items(self, user_id: int) -> frozenset[int]: ...
+    def iter_reviews(self) -> Iterable[ReviewRecord]: ...
 
 
 class BaseDataLoader(ABC):
-    """[Member 1 Contract] Abstract interface for loading game metadata and interactions."""
+    @abstractmethod
+    def load_interactions(self, source_path: str) -> list[InteractionRecord]: ...
 
     @abstractmethod
-    def load_interactions(self, source_path: str) -> List[InteractionRecord]:
-        """Load and validate user-game interactions from a file."""
+    def load_games(self, source_path: str) -> dict[str, GameItem]: ...
 
-    @abstractmethod
-    def load_games(self, source_path: str) -> Dict[str, "GameItem"]:
-        """Load game catalog metadata keyed by raw game_id."""
+
+def checked_indices(item_ids, num_items):
+    try:
+        values = np.asarray(item_ids)
+        # Preserve type information for mixed Python lists (e.g. [1, True]).
+        original = values if isinstance(item_ids, np.ndarray) else np.asarray(item_ids, dtype=object)
+    except (TypeError, ValueError) as exc:
+        raise InvalidParameterError("item_ids must be a one-dimensional integer sequence") from exc
+    if values.ndim != 1:
+        raise InvalidParameterError("item_ids must be a one-dimensional integer sequence")
+    if not values.size:
+        return np.empty(0, dtype=np.int64)
+    if (any(isinstance(v, (bool, np.bool_)) or not isinstance(v, Integral) for v in original)
+            or (values < 0).any() or (values >= num_items).any()):
+        raise InvalidParameterError("item_ids must contain valid internal item indices")
+    return values.astype(np.int64)
+
+
+def checked_scores(scores, count):
+    try:
+        values = np.asarray(scores)
+        if values.dtype.kind not in "fiu" or values.shape != (count,) or not np.isfinite(values).all():
+            raise ValueError("invalid scores")
+    except (TypeError, ValueError) as exc:
+        raise DataValidationError("Scores must be a finite real vector matching candidate order/length") from exc
+    return values.astype(float, copy=True)
 
 
 class BaseRecommender(ABC):
-    """[Member 2 Contract] Abstract base class for all recommendation models."""
-
-    def __init__(self, name: str) -> None:
-        self._name: str = name
-        self._is_fitted: bool = False
-        self._num_users: int = 0
-        self._num_items: int = 0
+    def __init__(self, name):
+        self._name = name
+        self._is_fitted = False
+        self._num_users = self._num_items = 0
+        self._mapping_fingerprint = self._train_fingerprint = None
 
     @property
-    def name(self) -> str:
-        """Name of the recommendation algorithm."""
-        return self._name
+    def name(self): return self._name
 
     @property
-    def is_fitted(self) -> bool:
-        """True if the model has undergone successful training."""
-        return self._is_fitted
+    def is_fitted(self): return self._is_fitted
 
-    def _check_fitted(self) -> None:
-        """Guard clause raising ModelNotFittedError if model has not been trained."""
-        if not self._is_fitted:
-            raise ModelNotFittedError(
-                f"Model '{self._name}' has not been fitted yet. Call fit(dataset) first."
-            )
+    @property
+    def num_users(self): return self._num_users
 
-    def fit(self, dataset: "InteractionDataset") -> "BaseRecommender":
-        """Template method: validates dataset, delegates to _fit_internal, marks fitted."""
-        if dataset is None or dataset.num_interactions == 0:
-            raise EmptyDatasetError("Cannot train model on an empty InteractionDataset.")
+    @property
+    def num_items(self): return self._num_items
 
-        self._num_users = dataset.num_users
-        self._num_items = dataset.num_items
-        self._fit_internal(dataset)
-        self._is_fitted = True
-        return self
+    @property
+    def mapping_fingerprint(self): return self._mapping_fingerprint
 
-    @abstractmethod
-    def _fit_internal(self, dataset: "InteractionDataset") -> None:
-        """Concrete subclasses implement their core training algorithm here."""
+    @property
+    def train_fingerprint(self): return self._train_fingerprint
+
+    def _check_fitted(self):
+        if not self.is_fitted:
+            raise ModelNotFittedError(f"Model {self.name!r} is not fitted")
+
+    def _check_user(self, user_id):
+        if isinstance(user_id, bool) or not isinstance(user_id, Integral) or not 0 <= user_id < self.num_users:
+            raise InvalidParameterError("user_id is outside the fitted mapping")
 
     @abstractmethod
-    def score_items(self, user_idx: int, item_indices: np.ndarray) -> np.ndarray:
-        """Predict relevance scores for a given internal user_idx across item_indices."""
+    def fit(self, train_dataset, *, validation_score=None, item_features=None, verbose=False): ...
 
-    def recommend(
-        self,
-        user_idx: int,
-        dataset: "InteractionDataset",
-        top_k: int = 10,
-        exclude_seen: bool = True,
-    ) -> List[ScoredItem]:
-        """Generate top-K ScoredItems for an internal user_idx."""
+    @abstractmethod
+    def score_items(self, user_id, item_ids): ...
+
+    @abstractmethod
+    def config(self) -> dict: ...
+
+    def recommend(self, user_id, train_dataset, top_k=10, exclude_seen=True):
         self._check_fitted()
-        if top_k <= 0:
-            raise InvalidParameterError(f"top_k must be a positive integer, got {top_k}.")
-        if not (0 <= user_idx < self._num_users):
-            raise InvalidParameterError(
-                f"user_idx {user_idx} out of range [0, {self._num_users})."
-            )
-
-        all_items = np.arange(self._num_items, dtype=np.int64)
+        self._check_user(user_id)
+        if isinstance(top_k, bool) or not isinstance(top_k, Integral) or top_k <= 0:
+            raise InvalidParameterError("top_k must be a positive integer")
+        if not isinstance(exclude_seen, bool):
+            raise InvalidParameterError("exclude_seen must be boolean")
+        if (getattr(train_dataset, "split_name", None) != "train"
+                or getattr(train_dataset, "num_users", None) != self.num_users
+                or getattr(train_dataset, "num_items", None) != self.num_items
+                or getattr(train_dataset, "mapping_fingerprint", None) != self.mapping_fingerprint
+                or getattr(train_dataset, "fingerprint", None) != self.train_fingerprint):
+            raise DataValidationError("recommend requires the fitted train content and mapping fingerprints")
+        candidates = np.arange(self.num_items, dtype=np.int64)
         if exclude_seen:
-            seen_items = dataset.get_user_seen_items(user_idx)
-            if seen_items:
-                mask = np.ones(self._num_items, dtype=bool)
-                mask[list(seen_items)] = False
-                candidate_items = all_items[mask]
-            else:
-                candidate_items = all_items
-        else:
-            candidate_items = all_items
-
-        if candidate_items.size == 0:
+            seen = checked_indices(list(train_dataset.get_user_seen_items(int(user_id))), self.num_items)
+            candidates = np.setdiff1d(candidates, seen, assume_unique=True)
+        if not candidates.size:
             return []
+        scores = checked_scores(self.score_items(user_id, candidates), len(candidates))
+        order = np.lexsort((candidates, -scores))[:top_k]
+        return [ScoredItem(int(candidates[i]), float(scores[i])) for i in order]
 
-        scores = self.score_items(user_idx, candidate_items)
-        k = min(top_k, candidate_items.size)
-        # Sort descending by score (with deterministic tie-breaking by item_idx)
-        ranked_order = np.lexsort((candidate_items, -scores))[:k]
-        return [
-            ScoredItem(item_idx=int(candidate_items[i]), score=float(scores[i]))
-            for i in ranked_order
-        ]
+
+class BaseEvaluator(ABC):
+    @abstractmethod
+    def evaluate(self, model, train_dataset, evaluation_dataset, *, additional_seen_dataset=None): ...
 
 
 class BaseMetric(ABC):
@@ -152,8 +165,5 @@ class BaseMetric(ABC):
         """Compute metric score in [0.0, 1.0] for a single user."""
 
 
-__all__ = [
-    "BaseDataLoader",
-    "BaseRecommender",
-    "BaseMetric",
-]
+__all__ = ["BaseDataLoader", "BaseRecommender", "BaseMetric", "BaseEvaluator",
+           "InteractionDataset", "IdMapper"]
