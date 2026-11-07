@@ -48,5 +48,22 @@ class TestCatalog(unittest.TestCase):
             svc.get_game_details("non_existent_game")
 
 
+    def test_get_user_played_games_invalid_user_id_raises(self):
+        from src.contracts.exceptions import InvalidParameterError
+        svc = RecommendationService(self.model).train(self.data)
+        for bad_id in ("", "   ", None, 123):
+            with self.subTest(bad_id=bad_id):
+                with self.assertRaises(InvalidParameterError):
+                    svc.get_user_played_games(bad_id)
+
+    def test_get_game_details_invalid_game_id_raises(self):
+        from src.contracts.exceptions import InvalidParameterError
+        svc = RecommendationService(self.model).train(self.data)
+        for bad_id in ("", "   ", None, 123):
+            with self.subTest(bad_id=bad_id):
+                with self.assertRaises(InvalidParameterError):
+                    svc.get_game_details(bad_id)
+
+
 if __name__ == "__main__":
     unittest.main()

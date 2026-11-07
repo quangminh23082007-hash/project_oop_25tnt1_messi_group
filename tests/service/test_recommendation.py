@@ -92,7 +92,7 @@ class TestRecommendation(unittest.TestCase):
 
     def test_recommend_games_invalid_top_k_raises(self):
         svc = RecommendationService(self.model).train(self.data)
-        for bad_k in (0, -5, True, 1.5, "10"):
+        for bad_k in (0, -5, True, 1.5, "10", "abc"):
             with self.subTest(bad_k=bad_k):
                 with self.assertRaises(InvalidParameterError):
                     svc.recommend_games("u0", top_k=bad_k)
@@ -155,6 +155,38 @@ class TestRecommendation(unittest.TestCase):
         self.assertEqual(len(results), 2)
         rec_ids = [r.game_id for r in results]
         self.assertEqual(rec_ids, ["g2", "g4"])
+
+
+    def test_recommend_games_price_filter_excludes_unknown_price_games(self):
+        # Contract Section 3: GameItem price None is excluded when max_price is specified
+        svc = RecommendationService(self.model).train(self.data)
+        results = svc.recommend_games("u0", top_k=5, max_price=100.0)
+        rec_ids = [r.game_id for r in results]
+        self.assertNotIn("g4", rec_ids)
+        self.assertIn("g2", rec_ids)
+        self.assertIn("g3", rec_ids)
+
+    def test_recommend_games_multi_genre_filter_and_case_insensitive(self):
+        svc = RecommendationService(self.model).train(self.data)
+        results = svc.recommend_games("u0", top_k=5, genre_filter=["strategy", "RPG"])
+        rec_ids = [r.game_id for r in results]
+        self.assertIn("g2", rec_ids)
+        self.assertIn("g3", rec_ids)
+
+    def test_recommend_games_invalid_filter_parameters_raise(self):
+        svc = RecommendationService(self.model).train(self.data)
+        for bad_price in (-5.0, True, "abc", float("nan"), float("inf")):
+            with self.subTest(bad_price=bad_price):
+                with self.assertRaises(InvalidParameterError):
+                    svc.recommend_games("u0", max_price=bad_price)
+
+        for bad_genre in ("", ["   "], [""], 123, [123]):
+            with self.subTest(bad_genre=bad_genre):
+                with self.assertRaises(InvalidParameterError):
+                    svc.recommend_games("u0", genre_filter=bad_genre)
+
+        with self.assertRaises(InvalidParameterError):
+            svc.recommend_games("u0", exclude_played="yes")
 
 
 if __name__ == "__main__":

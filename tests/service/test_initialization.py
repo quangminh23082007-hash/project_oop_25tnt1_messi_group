@@ -114,5 +114,20 @@ class TestInitialization(unittest.TestCase):
         self.assertIs(svc.fallback_model, self.fallback_model)
 
 
+    def test_dynamic_allow_cold_start_fallback_toggle(self):
+        svc = RecommendationService(self.model, fallback_model=self.fallback_model)
+        svc.train(self.data)
+        self.assertFalse(svc.allow_cold_start_fallback)
+
+        # Toggle to True
+        svc.allow_cold_start_fallback = True
+        self.assertTrue(svc.allow_cold_start_fallback)
+        self.assertTrue(svc.fallback_model.is_fitted)
+
+        # Invalid toggle
+        with self.assertRaises(InvalidParameterError):
+            svc.allow_cold_start_fallback = "True"
+
+
 if __name__ == "__main__":
     unittest.main()

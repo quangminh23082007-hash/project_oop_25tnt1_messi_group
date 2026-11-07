@@ -62,5 +62,20 @@ class TestEvaluation(unittest.TestCase):
             svc.evaluate_model(empty_val_data)
 
 
+    def test_evaluate_model_without_evaluator_raises_configuration_error(self):
+        from src.contracts.exceptions import ConfigurationError
+        svc = RecommendationService(self.model).train(self.data)
+        val_data = StubDataset(split_name="validation")
+        with self.assertRaises(ConfigurationError):
+            svc.evaluate_model(val_data)
+
+    def test_evaluate_model_additional_seen_invalid_split_raises(self):
+        svc = RecommendationService(self.model, evaluator=self.evaluator).train(self.data)
+        test_data = StubDataset(split_name="test")
+        invalid_seen_data = StubDataset(split_name="test")
+        with self.assertRaises(DataValidationError):
+            svc.evaluate_model(test_data, additional_seen_dataset=invalid_seen_data)
+
+
 if __name__ == "__main__":
     unittest.main()

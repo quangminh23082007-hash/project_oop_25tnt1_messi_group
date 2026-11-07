@@ -86,5 +86,13 @@ class TestTraining(unittest.TestCase):
         self.assertFalse(new_model.is_fitted)
 
 
+    def test_train_failure_raises_specific_training_error(self):
+        from src.contracts.exceptions import TrainingError
+        svc = RecommendationService(BrokenModel())
+        with self.assertRaises(TrainingError):
+            svc.train(self.data)
+        self.assertFalse(svc.is_ready)
+
+
 if __name__ == "__main__":
     unittest.main()

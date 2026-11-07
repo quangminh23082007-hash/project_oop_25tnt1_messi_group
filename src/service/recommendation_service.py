@@ -460,6 +460,79 @@ class RecommendationService:
             raise DataValidationError("get_game_by_raw_id must return a GameItem instance.")
         return game
 
+    def get_available_user_ids(self, limit: Optional[int] = None) -> tuple[str, ...]:
+        """Return raw user IDs, optionally sampled for a UI selector."""
+        self._ensure_ready()
+        mapper = self._train_dataset.user_mapper
+        if limit is not None and limit > 0 and mapper.size > limit:
+            step = max(1, mapper.size // limit)
+            indices = list(range(0, mapper.size, step))[:limit]
+            return tuple(str(mapper.to_raw(index)) for index in indices)
+        return tuple(str(mapper.to_raw(index)) for index in range(mapper.size))
+
+    def get_available_game_ids(self) -> tuple[str, ...]:
+        """Return raw game IDs available in the fitted catalog mapping."""
+        self._ensure_ready()
+        mapper = self._train_dataset.item_mapper
+        return tuple(str(mapper.to_raw(index)) for index in range(mapper.size))
+
+    def get_available_genres(self) -> tuple[str, ...]:
+        """Return sorted catalog genres for UI filters."""
+        self._ensure_ready()
+        genres: set[str] = set()
+        for raw_game_id in self.get_available_game_ids():
+            try:
+                game = self._train_dataset.get_game_by_raw_id(raw_game_id)
+            except (KeyError, IndexError, UnknownItemError):
+                continue
+            genres.update(str(genre).strip() for genre in game.genres if str(genre).strip())
+        return tuple(sorted(genres, key=str.casefold))
+
+    def recommend_baseline(
+        self,
+        raw_user_id: Optional[str] = None,
+        top_k: int = 10,
+        exclude_played: bool = True,
+        genre_filter: Any = None,
+        max_price: Optional[float] = None,
+    ) -> List[RecommendationResult]:
+        """Generate baseline recommendations from the popularity fallback model."""
+        self._ensure_ready()
+        self._ensure_fallback_ready()
+        mapped_user_idx: Optional[int] = None
+        if raw_user_id is not None and str(raw_user_id).strip():
+            try:
+                mapped_user_idx = self._user_idx(validate_id(str(raw_user_id).strip(), "raw_user_id"))
+            except (UnknownUserError, InvalidParameterError):
+                mapped_user_idx = None
+        scored_items = self._fallback_scores(
+            exclude_seen_for_user=mapped_user_idx if exclude_played else None
+        )
+        criteria = parse_filter_criteria(genre_filter, max_price)
+        top_k = validate_top_k(top_k)
+        results: List[RecommendationResult] = []
+        model_name = getattr(self._fallback_model, "name", "Popularity baseline")
+        for scored in scored_items:
+            raw_game_id = self._train_dataset.item_mapper.to_raw(scored.item_idx)
+            try:
+                game = self._train_dataset.get_game_by_raw_id(raw_game_id)
+            except (KeyError, IndexError, UnknownItemError):
+                continue
+            if not game_passes_filters(game, criteria):
+                continue
+            results.append(
+                to_recommendation_result(
+                    scored,
+                    game,
+                    len(results) + 1,
+                    model_name,
+                    True,
+                )
+            )
+            if len(results) == top_k:
+                break
+        return results
+
     def evaluate_model(
         self,
         evaluation_dataset: Any,
