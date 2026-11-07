@@ -25,7 +25,6 @@ class InteractionRecord:
     item_id: str
     rating: float
     timestamp: int = 0
-    text: str | None = None
 
     def __post_init__(self):
         for name in ("user_id", "item_id"):
@@ -35,8 +34,6 @@ class InteractionRecord:
             object.__setattr__(self, name, value.strip())
         _label(self.rating)
         _index(self.timestamp, "timestamp")
-        if self.text is not None and not isinstance(self.text, str):
-            raise DataValidationError("text must be a string or None")
 
 
 @dataclass(frozen=True)
