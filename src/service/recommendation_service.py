@@ -564,4 +564,22 @@ class RecommendationService:
         return format_recommendations_table(results)
 
 
+
+    @classmethod
+    def load_pretrained(
+        cls,
+        folder: Any,
+        *,
+        allow_cold_start_fallback: bool = False,
+        catalog_lookup: Any = None,
+    ) -> Any:
+        """Load a trained model bundle and return a PretrainedServiceFacade (Contracts v1.1 Section 6)."""
+        from src.service.pretrained import PretrainedServiceFacade
+        return PretrainedServiceFacade.load(
+            folder,
+            allow_cold_start_fallback=allow_cold_start_fallback,
+            catalog_lookup=catalog_lookup,
+        )
+
+
 __all__ = ["RecommendationService"]

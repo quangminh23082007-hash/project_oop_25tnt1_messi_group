@@ -1,15 +1,139 @@
 import unittest
+from typing import Any, Dict, List, Optional
+from unittest.mock import patch
+import numpy as np
 
+from src.contracts.dto import GameItem, RecommendationResult
 from src.contracts.exceptions import (
     ColdStartError,
+    ConfigurationError,
+    InvalidParameterError,
+    UnknownItemError,
     UnknownUserError,
 )
-from src.service.pretrained import PretrainedServiceFacade
+from src.service.pretrained import PretrainedDatasetProxy, PretrainedServiceFacade
+from src.service.recommendation_service import RecommendationService
 from tests.service.conftest import (
     StubDataset,
     StubModel,
     StubPopularityRecommender,
 )
+
+
+class StubRealPretrainedRecommender:
+    """Mock simulating src.models.pretrained.PretrainedRecommender (Contracts v1.1)."""
+
+    def __init__(self, allow_cold_start_fallback: bool = False, catalog_lookup: Any = None):
+        self._users = {"u0": 0, "u1": 1, "u2": 2}
+        self._items = ("g0", "g1", "g2", "g3")
+        self._item_map = {item: i for i, item in enumerate(self._items)}
+        self._catalog = {
+            "g0": {"title": "Game 0", "image_url": "example0.png", "categories": ["Action"]},
+            "g1": {"title": "Game 1", "image_url": "example1.png", "categories": ["RPG"]},
+            "g2": {"title": "Game 2", "image_url": "example2.png", "categories": ["Strategy"]},
+            "g3": {"title": "Game 3", "image_url": "example3.png", "categories": ["Action"]},
+        }
+        self.model_name = "BPRMatrixFactorization"
+        self.allow_cold_start_fallback = allow_cold_start_fallback
+        self._catalog_lookup = catalog_lookup
+        self.provenance = {
+            "protocol": "legacy-kaggle-format-3",
+            "data_fingerprint": "original-training",
+            "data_config": {"train_fraction": 0.7},
+        }
+        self._seen = np.array([[0, 0], [0, 1], [1, 2]])
+        self._popularity = type("Popularity", (), {"counts": np.array([3.0, 2.0, 1.0, 0.5])})()
+        self._model = type(
+            "InnerModel",
+            (),
+            {
+                "source": "BPRMatrixFactorization",
+                "score_all": lambda s, u: np.array([5.0, 4.0, 20.0, 15.0]) if u == 0 else np.array([1.0, 2.0, 3.0, 4.0]),
+            },
+        )()
+
+    @classmethod
+    def load(cls, folder, *, allow_cold_start_fallback=False, catalog_lookup=None):
+        return cls(allow_cold_start_fallback=allow_cold_start_fallback, catalog_lookup=catalog_lookup)
+
+    def _history(self, user):
+        lo = np.searchsorted(self._seen[:, 0], user, side="left")
+        hi = np.searchsorted(self._seen[:, 0], user, side="right")
+        return self._seen[lo:hi, 1]
+
+    def get_game_details(self, raw_game_id):
+        if raw_game_id not in self._item_map:
+            raise UnknownItemError(f"Game not present in trained mapping: {raw_game_id}")
+        if self._catalog_lookup is not None:
+            return self._catalog_lookup(raw_game_id)
+        row = self._catalog.get(raw_game_id, {})
+        return GameItem(
+            item_id=raw_game_id,
+            title=row.get("title", raw_game_id),
+            genres=tuple(row.get("categories", ())),
+            price=19.99 if raw_game_id == "g2" else None,
+        )
+
+    def get_catalog_metadata(self, raw_game_id):
+        self.get_game_details(raw_game_id)
+        return dict(self._catalog.get(raw_game_id, {}))
+
+    def get_user_played_games(self, raw_user_id):
+        user = self._users.get(raw_user_id)
+        if user is None:
+            raise UnknownUserError("Source user is absent from the trained mapping")
+        return [self.get_game_details(self._items[i]) for i in self._history(user)]
+
+    def recommend_games(
+        self,
+        raw_user_id: str,
+        top_k: int = 10,
+        exclude_played: bool = True,
+        genre_filter: Any = None,
+        max_price: Optional[float] = None,
+        *,
+        extra_seen: Any = (),
+    ) -> List[RecommendationResult]:
+        user = self._users.get(raw_user_id)
+        fallback = user is None
+        if fallback and not self.allow_cold_start_fallback:
+            raise UnknownUserError("No trained profile for this source user; enable popularity fallback explicitly")
+        scores = self._popularity.counts if fallback else self._model.score_all(user)
+        excluded = set()
+        if exclude_played:
+            if user is not None:
+                excluded.update(self._history(user))
+            excluded.update(self._item_map[g] for g in extra_seen if g in self._item_map)
+
+        order = np.lexsort((np.arange(len(self._items)), -scores))
+        results = []
+        for idx in order:
+            if idx in excluded:
+                continue
+            gid = self._items[idx]
+            game = self.get_game_details(gid)
+            if genre_filter is not None:
+                g_targets = {genre_filter.casefold()} if isinstance(genre_filter, str) else {g.casefold() for g in genre_filter}
+                if not g_targets.intersection(g.casefold() for g in game.genres):
+                    continue
+            if max_price is not None and (game.price is None or game.price > max_price):
+                continue
+            results.append(
+                RecommendationResult(
+                    rank=len(results) + 1,
+                    game_id=game.item_id,
+                    title=game.title,
+                    genres=game.genres,
+                    predicted_score=float(scores[idx]),
+                    price=game.price,
+                    developer=game.developer,
+                    model_name="Popularity" if fallback else self.model_name,
+                    is_fallback=fallback,
+                )
+            )
+            if len(results) == top_k:
+                break
+        return results
 
 
 class TestPretrained(unittest.TestCase):
@@ -74,6 +198,83 @@ class TestPretrained(unittest.TestCase):
         results = facade.recommend_games("u2", top_k=2)
         self.assertEqual(len(results), 2)
         self.assertTrue(results[0].is_fallback)
+
+    def test_pretrained_service_facade_accepts_native_pretrained_recommender(self):
+        recommender = StubRealPretrainedRecommender(allow_cold_start_fallback=False)
+        facade = PretrainedServiceFacade(recommender)
+
+        self.assertEqual(facade.model_name, "BPRMatrixFactorization")
+        self.assertEqual(facade.provenance["protocol"], "legacy-kaggle-format-3")
+        self.assertFalse(facade.allow_cold_start_fallback)
+
+        # Basic personalized recommendation
+        results = facade.recommend_games("u0", top_k=2)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].game_id, "g2")
+        self.assertEqual(results[1].game_id, "g3")
+        self.assertFalse(results[0].is_fallback)
+
+        # Played games inspection
+        played = facade.get_user_played_games("u0")
+        played_ids = [p.item_id for p in played]
+        self.assertEqual(played_ids, ["g0", "g1"])
+
+        # Game details and catalog metadata
+        game = facade.get_game_details("g0")
+        self.assertEqual(game.item_id, "g0")
+        meta = facade.get_catalog_metadata("g0")
+        self.assertEqual(meta["image_url"], "example0.png")
+
+        # Unknown user without fallback raises UnknownUserError
+        with self.assertRaises(UnknownUserError):
+            facade.recommend_games("non_existent_user")
+
+        # Enable cold-start fallback via property setter
+        facade.allow_cold_start_fallback = True
+        self.assertTrue(facade.allow_cold_start_fallback)
+        fallback_results = facade.recommend_games("non_existent_user", top_k=2)
+        self.assertEqual(len(fallback_results), 2)
+        self.assertTrue(all(r.is_fallback for r in fallback_results))
+        self.assertEqual(fallback_results[0].model_name, "Popularity")
+
+        # Session dynamic interaction recording
+        facade.record_user_interaction("u0", "g2", rating=1.0)
+        played_after = facade.get_user_played_games("u0")
+        self.assertIn("g2", [p.item_id for p in played_after])
+
+        # Excludes dynamically recorded game from subsequent recommendations
+        rec_after = facade.recommend_games("u0", top_k=1)
+        self.assertEqual(rec_after[0].game_id, "g3")
+
+        # UI helper methods
+        self.assertEqual(facade.get_available_user_ids(), ("u0", "u1", "u2"))
+        self.assertEqual(facade.get_available_game_ids(), ("g0", "g1", "g2", "g3"))
+        genres = facade.get_available_genres()
+        self.assertIn("Action", genres)
+        self.assertIn("RPG", genres)
+
+        # Baseline recommendations (u0 has seen g0, g1, g2 out of 4 items -> returns remaining g3)
+        baseline = facade.recommend_baseline("u0", top_k=2)
+        self.assertEqual(len(baseline), 1)
+        self.assertEqual(baseline[0].game_id, "g3")
+        self.assertTrue(baseline[0].is_fallback)
+
+        # Dataset proxy generation
+        ds_proxy = facade.dataset
+        self.assertIsInstance(ds_proxy, PretrainedDatasetProxy)
+        self.assertEqual(ds_proxy.num_users, 3)
+        self.assertEqual(ds_proxy.num_items, 4)
+        self.assertEqual(ds_proxy.user_mapper.to_raw(0), "u0")
+
+    def test_load_pretrained_factory(self):
+        fake_module = type("FakeModule", (), {"PretrainedRecommender": StubRealPretrainedRecommender})
+        with patch("src.service.pretrained.import_module", return_value=fake_module):
+            facade = PretrainedServiceFacade.load("fake/bundle/path", allow_cold_start_fallback=True)
+            self.assertEqual(facade.model_name, "BPRMatrixFactorization")
+            self.assertTrue(facade.allow_cold_start_fallback)
+
+            svc_facade = RecommendationService.load_pretrained("fake/bundle/path", allow_cold_start_fallback=True)
+            self.assertEqual(svc_facade.model_name, "BPRMatrixFactorization")
 
 
 if __name__ == "__main__":
