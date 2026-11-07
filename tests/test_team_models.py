@@ -229,8 +229,12 @@ class TeamModelTests(unittest.TestCase):
             with self.assertRaises(ConfigurationError): cls(unsupported_option=1)
 
     def test_binary_labels_and_source_text_preserved(self):
-        value = InteractionRecord("  User A ", " Game ", 0, text=" Text\nunchanged ")
-        self.assertEqual((value.user_id, value.item_id, value.text), ("User A", "Game", " Text\nunchanged "))
+        value = InteractionRecord("  User A ", " Game ", 0)
+        self.assertEqual((value.user_id, value.item_id), ("User A", "Game"))
+
+        review = ReviewRecord(0, 0, 0.0, 0, " Text\nunchanged ")
+        self.assertEqual(review.text, " Text\nunchanged ")
+        
         for rating in (4.5, np.nan, "1", True):
             with self.assertRaises(DataValidationError): Interaction(0, 1, rating)
 
