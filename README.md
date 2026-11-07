@@ -1,102 +1,60 @@
-# Evaluation và benchmark với model đã train
+# Steam Game Recommender
 
-Gói cập nhật này giữ đường đề xuất pretrained v1.1 và bổ sung benchmark tính lại Recall/NDCG từ prepared data gốc. Benchmark nạp BPR/TextBPR đã train, fit Cornac MostPop trên đúng train positives gốc, rồi chấm các model trên cùng user, ground truth, lịch sử và tập ứng viên.
+Đồ án xây dựng hệ thống đề xuất game với các tầng Data, Model, Service và Evaluation. Mọi tầng dùng chung DTO, giao diện và ngoại lệ trong `src/contracts/`.
 
-Không train lại BPR/TextBPR, không chạy encoder và không sửa thư viện Cornac.
+## Mã nguồn và tài liệu
 
-## Các file cập nhật
+| Phần | Vị trí |
+| --- | --- |
+| Data | [`src/data/`](src/data/) |
+| Model | [`src/models/`](src/models/), [hướng dẫn bàn giao](docs/MODEL_HANDOFF.md) |
+| Service | [`src/service/`](src/service/) |
+| Evaluation | [`src/evaluation/`](src/evaluation/), [`benchmarks/`](benchmarks/), [giao thức benchmark](docs/evaluation.md) |
+| Hợp đồng | [`src/contracts/`](src/contracts/), [Contracts v1.1 cho model đã train](docs/Contracts_v1_1_Pretrained_2026-11-06.html) |
 
-```text
-README.md
-requirements-evaluation.txt
-benchmarks/
-    run_pretrained.py
-    legacy_adapter.py
-    cornac_adapter.py
-configs/
-    benchmark.json
-docs/
-    evaluation.md
-src/evaluation/
-    evaluator.py
-    protocol.py
-tests/evaluation/
-    conftest.py
-    test_evaluator.py
-    test_cornac_adapter.py
-    test_model_integration.py
-    test_benchmark_integration.py
-```
+## Môi trường
 
-Chép vào đúng đường dẫn trong repo đã tích hợp. Giữ những file đang có như `metrics.py`, `result.py`, `pretrained_report.py`, cấu hình inference và các bộ kiểm thử khác. Gói cập nhật không thay thế toàn bộ repo, source Model hay weights.
-
-## Chuẩn bị
-
-Chạy từ thư mục gốc dự án, dùng CPython trong `.venv`:
+Chạy các lệnh từ thư mục gốc của repo. Trên Windows, dùng CPython 3.10 trở lên.
 
 ```powershell
+py -3.10 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-evaluation.txt
 ```
 
-Cần toàn bộ `src/models/` và một bộ `src/contracts/` thống nhất. Không chỉ chép riêng `pretrained.py`: package Model còn dùng các public modules và `_array/`. Không bắt buộc `pip install -e .` khi repo chưa có `pyproject.toml` phù hợp.
+Trên Linux hoặc macOS, dùng trình thông dịch `.venv/bin/python` tương ứng. Để chạy Data với Parquet, cài thêm nhóm phụ thuộc `data` của [`pyproject.toml`](pyproject.toml). Cấu hình đóng gói hiện tại bao gồm Model và contracts. Các lệnh benchmark bên dưới chạy từ mã nguồn trong repo.
 
-Benchmark cần hai loại artifact:
+## Dùng BPR và TextBPR đã train
 
-1. Bundle model đã train, gồm `weights.npz` và `model_info.json`, ví dụ `artifacts/models/bpr/cpu` và `artifacts/models/text_bpr/cpu`.
-2. Prepared data **đúng lần train đó**, gồm `dataset.npz`, `mappings.json`, `report.json`, `catalog.json` trong một thư mục.
-
-Clone source hoặc tải ZIP Source code của GitHub không cung cấp các artifact này. Nếu còn thiếu prepared data gốc, cần nhận lại từ người train Model trước khi chạy benchmark thực; không có cách suy ra ground truth từ weights.
-
-Prepared data mới do Data hiện tại tạo, hoặc bộ `mapping.json`/review CSV/JSONL mới xuất, không tự thay thế được bộ prepared gốc. Giống tỷ lệ 70/15/15 và seed vẫn chưa chứng minh cùng mapping và cùng split. Runner kiểm tra fingerprint và thứ tự raw IDs trước khi chấm.
-
-Nếu dùng installer của Model để cài ZIP BPR đã tải:
+Hai bundle CPU được phát hành riêng với mã nguồn. Tải [BPR và TextBPR từ release `pretrained-legacy-v1`](https://github.com/quangminh23082007-hash/project_oop_25tnt1_messi_group/releases/tag/pretrained-legacy-v1) bằng tài khoản có quyền đọc repo. Script cài đặt kiểm tra checksum của gói tải về và trọng số. Xem [hướng dẫn đầy đủ](docs/PRETRAINED_MODELS.md) và [metadata lần train gốc](docs/TRAINED_RUN_REFERENCE.json).
 
 ```powershell
 .\.venv\Scripts\python.exe -B scripts/install_model.py --archive "$env:USERPROFILE\Downloads\bpr-cpu-legacy-v1.zip" --model bpr
+.\.venv\Scripts\python.exe -B scripts/install_model.py --archive "$env:USERPROFILE\Downloads\text-bpr-cpu-legacy-v1.zip" --model text-bpr
+.\.venv\Scripts\python.exe -B scripts/recommend.py --model bpr --user "!" --k 10
 ```
 
-Cài TextBPR theo tài liệu/manifest tương ứng của Model. Mỗi bundle phải giữ đúng cặp metadata và weights, không đổi mapping để ép khớp Data mới.
+`!` là một ID trong dữ liệu huấn luyện. Người dùng chưa có hồ sơ nhận đề xuất theo độ phổ biến mặc định. Dùng `--no-fallback` khi cần kiểm tra hành vi báo lỗi. Khi tích hợp ứng dụng, nạp `PretrainedRecommender` một lần lúc khởi động và chuyển lịch sử của ứng dụng qua `extra_seen`. Dùng ID ứng dụng riêng và giữ ánh xạ của bundle cho người dùng nguồn.
 
-## Benchmark tính metric mới
+## Chạy benchmark
 
-Sửa `configs/benchmark.json`: đặt `prepared_dir`, đường dẫn các bundle và những model muốn so sánh. Phải giữ ít nhất một model nhóm và Cornac MostPop; không được tắt Cornac rồi báo đã hoàn thành benchmark ngoài.
+Benchmark nạp BPR và TextBPR đã train, fit `cornac.models.MostPop` trên các cặp tích cực của tập train gốc và chấm cả ba mô hình trên cùng người dùng, lịch sử và tập ứng viên. Các độ đo là Recall@5, Recall@10, NDCG@5 và NDCG@10.
+
+Đặt hai bundle vào `artifacts/models/bpr/cpu/` và `artifacts/models/text_bpr/cpu/`. Đặt bốn file prepared gốc (`dataset.npz`, `mappings.json`, `report.json`, `catalog.json`) vào `artifacts/prepared_original/`. Runner đối chiếu fingerprint và thứ tự ID của dữ liệu với bundle. Có thể đổi các đường dẫn trong [`configs/benchmark.json`](configs/benchmark.json).
+
+Chạy thử 100 người dùng của tập test.
 
 ```powershell
-.\.venv\Scripts\python.exe -m benchmarks.run_pretrained --mode benchmark --config configs/benchmark.json
-.\.venv\Scripts\python.exe -m benchmarks.run_pretrained --mode benchmark --config configs/benchmark.json --split validation --max-users 2000
-.\.venv\Scripts\python.exe -m benchmarks.run_pretrained --mode benchmark --config configs/benchmark.json --split test --max-users 2000 --output-dir results/benchmark_test
+.\.venv\Scripts\python.exe -B -m benchmarks.run_pretrained --mode benchmark --config configs/benchmark.json --split test --max-users 100
 ```
 
-`max_users=0` chấm toàn bộ user eligible; giá trị dương chọn một cohort cố định bằng seed. Việc lấy mẫu chỉ áp dụng user đánh giá, không giảm train của Cornac hoặc đổi weights. Mọi model dùng cùng cohort và thứ tự item gốc. Không truyền `--user` trong benchmark mode.
+Để chấm toàn bộ nhóm người dùng đủ điều kiện trong tập test, đổi `--max-users 100` thành `--max-users 0`. Terminal hiện phần trăm và thời gian theo từng mô hình. Báo cáo trong `results/benchmark/` gồm `summary.csv`, `per_user.csv`, `skipped_users.csv` và `run_config.json`. Chi tiết cách đọc kết quả nằm trong [tài liệu Evaluation](docs/evaluation.md).
 
-Mỗi run thành công tạo thư mục riêng với:
-
-- `summary.csv`: Recall/NDCG mới, số user được chấm/bỏ qua và thời gian.
-- `per_user.csv`: metric, ground truth, đề xuất và số ứng viên của từng user/model.
-- `skipped_users.csv`: lý do bỏ qua, nếu có.
-- `run_config.json`: cấu hình, phiên bản thư viện, checksum nguồn, provenance và `recomputed_metrics=true`.
-
-Cornac là thư viện thực được gọi qua adapter của nhóm. Thiếu Cornac hoặc artifact sai phải gây lỗi rõ ràng, không dùng bộ đếm tự viết thay thư viện và không điền metric giả.
-
-## Đề xuất và kiểm tra inference
-
-Mode mặc định vẫn là `recommend`:
+## Kiểm tra Model và Evaluation
 
 ```powershell
-.\.venv\Scripts\python.exe -m benchmarks.run_pretrained --config configs/evaluation_pretrained.json
-.\.venv\Scripts\python.exe -m benchmarks.run_pretrained --mode recommend --config configs/evaluation_pretrained.json --user "!"
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests -p test_team_models.py -v
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests -p test_numerical_core.py -v
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests/evaluation -v
 ```
 
-Mode này cần bundle và `docs/TRAINED_RUN_REFERENCE.json` tương ứng. Nó tạo `recommendations.csv`, `inference_checks.json`, `original_validation.csv`, `run_config.json`. `original_validation.csv` nhập lại chỉ số cũ; inference checks không phải accuracy. `!` là ví dụ raw ID nguồn của bundle đã bàn giao, không phải user mới của ứng dụng.
-
-Mọi đường dẫn tương đối lấy gốc là thư mục repo chứa `benchmarks/`, kể cả config, prepared, bundle và output. Chọn đúng `.venv`, tránh dùng nhầm Python MSYS hoặc môi trường khác.
-
-## Kiểm thử
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests/evaluation -p "test_*.py" -v
-```
-
-Các test dùng fixture nhỏ, bao gồm loader Model thật và Cornac thật khi dependency có sẵn. Fixture tổng hợp không phải dữ liệu hoặc kết quả Kaggle. Ca cần Model/Cornac báo skip rõ nếu chưa tích hợp; skip không được tính là đã kiểm tra thành công đường chạy thực.
-
-Ba test tích hợp native model cũ đã chuyển sang `test_model_integration.py`; `test_cornac_adapter.py` trở lại đúng trách nhiệm kiểm thử Cornac. Đọc [docs/evaluation.md](docs/evaluation.md) để xem protocol, API và cách diễn giải báo cáo.
+Kết quả benchmark đầy đủ được lưu riêng cùng cấu hình lần chạy để dùng cho báo cáo. Mã nguồn trên GitHub tham chiếu tới dữ liệu gốc và release model khi tái lập thực nghiệm.

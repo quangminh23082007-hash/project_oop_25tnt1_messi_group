@@ -1,0 +1,9 @@
+{
+  "n_factors": 16,
+  "n_epochs": 20,
+  "random_seed": 42,
+  "learning_rate": 0.01,
+  "reg": 0.01,
+  "patience": 5,
+  "text_reg": 0.001
+}
