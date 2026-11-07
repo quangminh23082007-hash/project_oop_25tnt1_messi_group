@@ -1,0 +1,23 @@
+{
+  "repository": "quangminh23082007-hash/project_oop_25tnt1_messi_group",
+  "tag": "pretrained-legacy-v1",
+  "protocol": "legacy-kaggle-70-15-15",
+  "models": {
+    "bpr": {
+      "asset": "bpr-cpu-legacy-v1.zip",
+      "sha256": "4bc30393291bcffd70703fa90c0adf2f148c06ccb55e80cce18793531a36583c",
+      "bytes": 375427623,
+      "num_users": 1394194,
+      "num_items": 23089,
+      "weights_sha256": "b256a91bf9add04f427f871c152383c4f60903df00889d325c8b50ef071a9d29"
+    },
+    "text-bpr": {
+      "asset": "text-bpr-cpu-legacy-v1.zip",
+      "sha256": "e04526f5e786811ad83585951f98f06d8ba588886855484db617c83d1206fc76",
+      "bytes": 376994389,
+      "num_users": 1394194,
+      "num_items": 23089,
+      "weights_sha256": "d9b7d86bcde3024fe2fa298885ae07b4affaa67bc3b1b9f63f2d399c46b4a28c"
+    }
+  }
+}
