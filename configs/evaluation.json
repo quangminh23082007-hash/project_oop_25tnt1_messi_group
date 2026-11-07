@@ -1,0 +1,30 @@
+{
+  "run_name": "evaluation_demo",
+  "seed": 42,
+  "protocol": {
+    "ks": [3, 5],
+    "positive_threshold": 1.0,
+    "exclude_seen": true,
+    "empty_ground_truth_policy": "skip",
+    "cold_start_policy": "skip"
+  },
+  "data": {
+    "source": "demo"
+  },
+  "models": [
+    {
+      "kind": "demo_popularity",
+      "name": "DemoPopularity",
+      "early_stopping": false
+    }
+  ],
+  "benchmark": {
+    "include_cornac": false,
+    "split": "test",
+    "early_stopping": false,
+    "selection_metric": "NDCG@5",
+    "history": "train",
+    "verbose": false
+  },
+  "output_dir": "results"
+}

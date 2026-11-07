@@ -1,0 +1,47 @@
+{
+  "run_name": "evaluation_real",
+  "seed": 42,
+  "protocol": {
+    "ks": [5, 10],
+    "positive_threshold": 1.0,
+    "exclude_seen": true,
+    "empty_ground_truth_policy": "skip",
+    "cold_start_policy": "skip"
+  },
+  "data": {
+    "source": "provided"
+  },
+  "models": [
+    {
+      "kind": "popularity",
+      "name": "Popularity",
+      "early_stopping": false
+    },
+    {
+      "kind": "bpr",
+      "name": "BPR",
+      "params": {
+        "n_factors": 32,
+        "learning_rate": 0.01,
+        "reg": 0.01,
+        "n_epochs": 30,
+        "patience": 5
+      },
+      "early_stopping": true
+    },
+    {
+      "kind": "cornac_most_pop",
+      "name": "CornacMostPop",
+      "early_stopping": false
+    }
+  ],
+  "benchmark": {
+    "include_cornac": false,
+    "split": "test",
+    "early_stopping": true,
+    "selection_metric": "NDCG@10",
+    "history": "train",
+    "verbose": false
+  },
+  "output_dir": "results"
+}

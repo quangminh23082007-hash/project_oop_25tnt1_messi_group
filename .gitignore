@@ -22,3 +22,9 @@ data/processed/
 *.zip
 .coverage
 htmlcov/
+
+env/
+.vscode/
+.idea/
+.DS_Store
+results/
