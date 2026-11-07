@@ -4,6 +4,8 @@ import json
 import tempfile
 import unittest
 from dataclasses import replace
+from hashlib import sha256
+from math import log2
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,7 +13,7 @@ import numpy as np
 
 import benchmarks.run_benchmark as runner
 from conftest import FixedScoreModel, make_splits
-from src.contracts.dto import Interaction
+from src.contracts.dto import EvaluationResult, Interaction, ScoredItem
 from src.contracts.exceptions import (
     ColdStartError,
     ConfigurationError,
@@ -22,6 +24,7 @@ from src.contracts.exceptions import (
 from src.contracts.interfaces import BaseEvaluator
 from src.evaluation import EvaluationProtocol, Evaluator
 from src.evaluation.result import summarize_result
+from src.evaluation.protocol import RankingEvaluationData
 
 
 class EvaluatorTests(unittest.TestCase):
@@ -433,6 +436,237 @@ class BenchmarkRunnerTests(unittest.TestCase):
                 self.run_config()
 
         save.assert_not_called()
+
+
+class FixedRankingProvider:
+    def __init__(self, data):
+        self.name = "RankingFixture"
+        self.num_users = data.num_users
+        self.num_items = data.num_items
+        self.data_fingerprint = data.data_fingerprint
+        self.calls = []
+        self.output = None
+        self.scores = {
+            0: {2: 3.0, 3: 2.0, 4: 1.0, 5: 0.0},
+            1: {1: 3.0, 2: 2.0, 3: 1.0, 4: 0.0, 5: -1.0},
+        }
+
+    def fit(self, *args, **kwargs):
+        raise AssertionError("Ranking evaluation must never fit a provider.")
+
+    def rank_items(self, user_id, *, top_k, seen_items):
+        self.calls.append((user_id, top_k, seen_items))
+        if self.output is not None:
+            return self.output(user_id, top_k, seen_items)
+        scores = self.scores.get(user_id, {})
+        candidates = [
+            ScoredItem(item_id, scores.get(item_id, -10.0))
+            for item_id in range(self.num_items)
+            if item_id not in seen_items
+        ]
+        return tuple(
+            sorted(candidates, key=lambda item: (-item.score, item.item_idx))[:top_k]
+        )
+
+
+class RankingEvaluatorTests(unittest.TestCase):
+    def setUp(self):
+        self.relevant = {
+            0: frozenset({2, 4}),
+            1: frozenset({3}),
+            2: frozenset({5}),
+            3: frozenset(),
+        }
+        self.seen = {
+            0: frozenset({0, 1}),
+            1: frozenset({0}),
+            2: frozenset({2}),
+            3: frozenset({3}),
+        }
+        self.data = RankingEvaluationData(
+            split_name="test",
+            num_users=4,
+            num_items=6,
+            user_ids=(0, 1, 2, 3),
+            get_relevant_items=lambda user_id: self.relevant[user_id],
+            get_seen_items=lambda user_id: self.seen[user_id],
+            has_positive_train=lambda user_id: user_id != 2,
+            data_fingerprint=sha256(b"ranking-evaluation-fixture-v1").hexdigest(),
+        )
+        self.provider = FixedRankingProvider(self.data)
+        self.evaluator = Evaluator(EvaluationProtocol(ks=(1, 2)))
+
+    def evaluate(self, **overrides):
+        return self.evaluator.evaluate_rankings(
+            overrides.get("model", self.provider),
+            overrides.get("data", self.data),
+        )
+
+    def test_known_metrics_shared_result_and_macro(self):
+        result = self.evaluate()
+
+        self.assertIsInstance(result, EvaluationResult)
+        self.assertEqual(tuple(user.user_id for user in result.per_user), (0, 1))
+        self.assertEqual(
+            {user.user_id: user.reason for user in result.skipped_users},
+            {2: "no_positive_train", 3: "empty_ground_truth"},
+        )
+        self.assertAlmostEqual(result.metrics["Recall@1"], 0.25)
+        self.assertAlmostEqual(result.metrics["Recall@2"], 0.25)
+        self.assertAlmostEqual(result.metrics["NDCG@1"], 0.5)
+        self.assertAlmostEqual(
+            result.metrics["NDCG@2"],
+            0.5 / (1.0 + 1.0 / log2(3)),
+        )
+        self.assertEqual(tuple(user.candidate_count for user in result.per_user), (4, 5))
+        self.assertEqual(result.fit_seconds, 0.0)
+        self.assertGreaterEqual(result.evaluate_seconds, 0.0)
+
+    def test_full_history_passed_and_cold_empty_users_not_scored(self):
+        self.evaluate()
+
+        self.assertEqual(
+            self.provider.calls,
+            [(0, 2, frozenset({0, 1})), (1, 2, frozenset({0}))],
+        )
+
+    def test_signed_scores_ties_and_repeatability(self):
+        self.provider.scores = {}
+        first = self.evaluate()
+
+        self.assertEqual(first.per_user[0].recommended_items, (2, 3))
+        self.assertEqual(first.per_user, self.evaluate().per_user)
+
+    def test_invalid_ranking_entries_and_order_are_rejected(self):
+        invalid = (
+            (ScoredItem(2, 1.0), ScoredItem(2, 0.0)),
+            (ScoredItem(0, 1.0), ScoredItem(2, 0.0)),
+            (ScoredItem(2, 1.0), ScoredItem(6, 0.0)),
+            (ScoredItem(True, 1.0), ScoredItem(2, 0.0)),
+            (ScoredItem(2, True), ScoredItem(3, 0.0)),
+            (ScoredItem(2, float("nan")), ScoredItem(3, 0.0)),
+            (ScoredItem(2, float("inf")), ScoredItem(3, 0.0)),
+            (ScoredItem(2, "1"), ScoredItem(3, 0.0)),
+            (ScoredItem(3, 1.0), ScoredItem(2, 1.0)),
+            (ScoredItem(2, 0.0), ScoredItem(3, 1.0)),
+            ((2, 1.0), (3, 0.0)),
+        )
+        for ranking in invalid:
+            with self.subTest(ranking=ranking):
+                self.provider.output = lambda *args, ranking=ranking: ranking
+                with self.assertRaises(DataValidationError):
+                    self.evaluate()
+
+    def test_top_k_must_be_filled_and_ordered(self):
+        invalid = (
+            (),
+            (ScoredItem(2, 1.0),),
+            (ScoredItem(2, 1.0), ScoredItem(3, 0.0), ScoredItem(4, -1.0)),
+            {2: 1.0, 3: 0.0},
+            iter((ScoredItem(2, 1.0), ScoredItem(3, 0.0))),
+        )
+        for ranking in invalid:
+            with self.subTest(ranking=ranking):
+                self.provider.output = lambda *args, ranking=ranking: ranking
+                with self.assertRaises(DataValidationError):
+                    self.evaluate()
+
+    def test_provider_identity_and_dimensions_are_required(self):
+        for attribute, value in (
+            ("data_fingerprint", sha256(b"other-source").hexdigest()),
+            ("num_users", 5),
+            ("num_items", True),
+            ("name", ""),
+            ("rank_items", None),
+        ):
+            provider = FixedRankingProvider(self.data)
+            setattr(provider, attribute, value)
+            with self.subTest(attribute=attribute):
+                with self.assertRaises(DataValidationError):
+                    self.evaluate(model=provider)
+            self.assertEqual(provider.calls, [])
+
+    def test_context_cohort_identity_and_callbacks_are_validated(self):
+        for changes in (
+            {"user_ids": (1, 0)},
+            {"user_ids": (0, 0)},
+            {"user_ids": (4,)},
+            {"user_ids": (True,)},
+            {"user_ids": [0, 1]},
+            {"split_name": "train"},
+            {"num_items": 0},
+            {"data_fingerprint": "fp-pretrained"},
+            {"data_fingerprint": "A" * 64},
+            {"get_seen_items": None},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaises(DataValidationError):
+                    self.evaluate(data=replace(self.data, **changes))
+        self.assertEqual(self.provider.calls, [])
+
+    def test_ground_truth_history_types_ranges_and_overlap_are_checked(self):
+        for changes in (
+            {"get_relevant_items": lambda user: {2}},
+            {"get_relevant_items": lambda user: frozenset({6})},
+            {"get_relevant_items": lambda user: frozenset({True})},
+            {"get_seen_items": lambda user: frozenset({-1})},
+            {"get_seen_items": lambda user: frozenset({2})},
+            {"has_positive_train": lambda user: 1},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaises(DataValidationError):
+                    self.evaluate(data=replace(self.data, **changes))
+
+    def test_cold_start_error_and_empty_ground_truth_zero(self):
+        self.evaluator = Evaluator(
+            EvaluationProtocol(ks=(1,), cold_start_policy="error")
+        )
+        with self.assertRaises(ColdStartError):
+            self.evaluate(data=replace(self.data, user_ids=(2,)))
+        self.assertEqual(self.provider.calls, [])
+
+        self.evaluator = Evaluator(
+            EvaluationProtocol(ks=(1,), empty_ground_truth_policy="zero")
+        )
+        result = self.evaluate(data=replace(self.data, user_ids=(3,)))
+        self.assertEqual(result.per_user[0].metrics, {"Recall@1": 0.0, "NDCG@1": 0.0})
+
+    def test_no_candidates_and_empty_cohort_are_reported_without_scoring(self):
+        self.evaluator = Evaluator(
+            EvaluationProtocol(ks=(1,), empty_ground_truth_policy="zero")
+        )
+        data = replace(
+            self.data,
+            user_ids=(3,),
+            get_seen_items=lambda user: frozenset(range(6)),
+        )
+        result = self.evaluate(data=data)
+        self.assertEqual(result.metrics, {})
+        self.assertEqual(result.skipped_users[0].reason, "no_candidates")
+        self.assertEqual(self.provider.calls, [])
+
+        result = self.evaluate(data=replace(self.data, user_ids=()))
+        self.assertEqual((result.metrics, result.per_user, result.skipped_users), ({}, (), ()))
+
+    def test_smaller_catalog_returns_available_items_only(self):
+        data = replace(
+            self.data,
+            user_ids=(0,),
+            get_relevant_items=lambda user: frozenset({5}),
+            get_seen_items=lambda user: frozenset(range(5)),
+        )
+        result = self.evaluate(data=data)
+        self.assertEqual(result.per_user[0].recommended_items, (5,))
+        self.assertEqual(result.per_user[0].candidate_count, 1)
+        self.assertEqual(result.metrics["Recall@2"], 1.0)
+
+    def test_new_path_requires_history_filtering(self):
+        self.evaluator = Evaluator(
+            EvaluationProtocol(ks=(1,), exclude_seen=False)
+        )
+        with self.assertRaises(ConfigurationError):
+            self.evaluate()
+        self.assertEqual(self.provider.calls, [])
 
 
 if __name__ == "__main__":

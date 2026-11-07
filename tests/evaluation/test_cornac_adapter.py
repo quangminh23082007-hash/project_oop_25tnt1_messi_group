@@ -1,279 +1,140 @@
-import csv
-import json
+import importlib.util
 import tempfile
+import types
 import unittest
-from dataclasses import replace
-from importlib.util import find_spec
 from pathlib import Path
-from time import perf_counter
+from unittest.mock import patch
 
 import numpy as np
 
-from conftest import make_splits
-from src.contracts.dto import EvaluationResult, ModelConfig
-from src.evaluation import EvaluationProtocol, Evaluator
-from src.evaluation.result import save_results
-
-
-MODELS_AVAILABLE = find_spec("src.models") is not None
-
-if MODELS_AVAILABLE:
-    from src.models import (
-        BPRMatrixFactorization,
-        PopularityRecommender,
-        TextBPRMatrixFactorization,
-    )
-    from src.models.text_features import build_item_features
-
-
-@unittest.skipUnless(
-    MODELS_AVAILABLE,
-    "src.models is not present in this checkout.",
+from benchmarks.cornac_adapter import CornacMostPopAdapter
+from benchmarks.legacy_adapter import LegacyPrepared
+from conftest import make_legacy_fixture, make_splits
+from src.contracts.exceptions import (
+    ConfigurationError,
+    DataValidationError,
+    ModelNotFittedError,
+    TrainingError,
 )
-class ModelIntegrationTests(unittest.TestCase):
+
+
+class FakeDataset:
+    def __init__(self, num_users, num_items, uid_map, iid_map, uir_tuple, seed=None):
+        self.num_users = num_users
+        self.num_items = num_items
+        self.uid_map = uid_map
+        self.iid_map = iid_map
+        self.uir_tuple = uir_tuple
+        self.seed = seed
+
+    @classmethod
+    def from_uir(cls, rows, seed=None):
+        users = {raw: index for index, raw in enumerate(sorted({row[0] for row in rows}, reverse=True))}
+        items = {raw: index for index, raw in enumerate(sorted({row[1] for row in rows}, reverse=True))}
+        return cls(len(users), len(items), users, items, (
+            np.array([users[row[0]] for row in rows], dtype=np.int64),
+            np.array([items[row[1]] for row in rows], dtype=np.int64),
+            np.ones(len(rows)),
+        ), seed=seed)
+
+
+class FakeMostPop:
+    def __init__(self, name):
+        self.name = name
+
+    def fit(self, dataset):
+        self.dataset = dataset
+        self.scores = np.bincount(dataset.uir_tuple[1], minlength=dataset.num_items).astype(float)
+        return self
+
+    def score(self, user_id):
+        return self.scores.copy()
+
+
+def fake_cornac():
+    return types.SimpleNamespace(
+        data=types.SimpleNamespace(Dataset=FakeDataset),
+        models=types.SimpleNamespace(MostPop=FakeMostPop),
+        __version__="TEST_ONLY_fake_cornac",
+    )
+
+
+class CornacAdapterTests(unittest.TestCase):
     def setUp(self):
-        self.splits = make_splits()
-        self.evaluator = Evaluator(
-            EvaluationProtocol(ks=(1, 3))
-        )
-        self.model_config = ModelConfig(
-            n_factors=3,
-            n_epochs=2,
-            learning_rate=0.01,
-            reg=0.01,
-            patience=1,
-            random_seed=42,
-        )
+        temporary = tempfile.TemporaryDirectory(prefix="cornac_adapter_")
+        self.addCleanup(temporary.cleanup)
+        self.fixture = make_legacy_fixture(Path(temporary.name))
+        self.prepared = LegacyPrepared.load(self.fixture["prepared_dir"])
 
-    def check_test_result(self, model):
-        result = self.evaluator.evaluate(
-            model,
-            self.splits.train,
-            self.splits.test,
-        )
+    def test_v1_positive_counts_remap_and_preserve_candidate_order(self):
+        with patch("benchmarks.cornac_adapter._load_cornac", return_value=fake_cornac()):
+            model = CornacMostPopAdapter().fit(make_splits().train)
+        np.testing.assert_array_equal(model.score_items(0, [5, 0, 1, 0]), [1, 2, 0, 2])
+        self.assertEqual(model.mapping_fingerprint, make_splits().train.mapping_fingerprint)
+        self.assertEqual(model.train_fingerprint, make_splits().train.fingerprint)
+        self.assertIsNone(model.data_fingerprint)
 
-        self.assertIsInstance(result, EvaluationResult)
-        self.assertEqual(
-            {row.user_id for row in result.per_user},
-            {0, 1, 4},
-        )
-        self.assertEqual(
-            {
-                row.user_id: row.reason
-                for row in result.skipped_users
-            },
-            {
-                2: "no_positive_train",
-                3: "empty_ground_truth",
-            },
-        )
+    def test_v1_unsupported_callback_invalidates_previous_fit(self):
+        with patch("benchmarks.cornac_adapter._load_cornac", return_value=fake_cornac()):
+            model = CornacMostPopAdapter().fit(make_splits().train)
+            with self.assertRaises(ConfigurationError):
+                model.fit(make_splits().train, validation_score=lambda candidate: 0.5)
+        self.assertFalse(model.is_fitted)
+        with self.assertRaises(ModelNotFittedError):
+            model.score_items(0, [0])
 
-        for row in result.per_user:
-            self.assertEqual(
-                len(row.recommended_items),
-                len(set(row.recommended_items)),
-            )
-            self.assertTrue(
-                set(row.recommended_items).isdisjoint(
-                    self.splits.train.get_user_seen_items(
-                        row.user_id
-                    )
-                )
-            )
-            self.assertTrue(
-                all(
-                    0.0 <= value <= 1.0
-                    for value in row.metrics.values()
-                )
-            )
+    def test_invalid_backend_scores_are_rejected(self):
+        with patch("benchmarks.cornac_adapter._load_cornac", return_value=fake_cornac()):
+            with patch.object(FakeMostPop, "score", return_value=[float("nan")] * 3):
+                with self.assertRaises(DataValidationError):
+                    CornacMostPopAdapter().fit(make_splits().train)
 
-        return result
+    def test_legacy_native_constructor_keeps_full_mapping_and_positive_pairs(self):
+        with patch("benchmarks.cornac_adapter._load_cornac", return_value=fake_cornac()):
+            model = CornacMostPopAdapter().fit_legacy(self.prepared)
+        dataset = model._model.dataset
+        self.assertEqual(dataset.num_users, self.prepared.num_users)
+        self.assertEqual(dataset.num_items, self.prepared.num_items)
+        self.assertEqual(dataset.uid_map, {raw: index for index, raw in enumerate(self.prepared.user_ids)})
+        np.testing.assert_array_equal(dataset.uir_tuple[0], self.prepared.train[:, 0])
+        np.testing.assert_array_equal(dataset.uir_tuple[1], self.prepared.train[:, 1])
+        self.assertEqual(len(dataset.uir_tuple[2]), len(self.prepared.train))
+        self.assertEqual(model.data_fingerprint, self.prepared.data_fingerprint)
+        self.assertIsNone(model.mapping_fingerprint)
+        self.assertIsNone(model.train_fingerprint)
 
-    def validation_callback(self, calls):
-        def score(candidate):
-            self.assertTrue(candidate.is_fitted)
-            self.assertEqual(
-                candidate.mapping_fingerprint,
-                self.splits.train.mapping_fingerprint,
-            )
-            self.assertEqual(
-                candidate.train_fingerprint,
-                self.splits.train.fingerprint,
-            )
+    def test_legacy_ranking_filters_all_history_and_breaks_ties_by_original_item(self):
+        with patch("benchmarks.cornac_adapter._load_cornac", return_value=fake_cornac()):
+            model = CornacMostPopAdapter().fit_legacy(self.prepared)
+        context = self.prepared.context("test")
+        ranked = model.rank_items(0, top_k=10, seen_items=context.get_seen_items(0))
+        self.assertEqual([row.item_idx for row in ranked], [4, 5])
+        self.assertEqual([row.score for row in ranked], [1.0, 1.0])
 
-            result = self.evaluator.evaluate(
-                candidate,
-                self.splits.train,
-                self.splits.validation,
-            )
-            self.assertIsInstance(
-                result,
-                EvaluationResult,
-            )
+    def test_failed_legacy_refit_invalidates_model_and_provenance(self):
+        with patch("benchmarks.cornac_adapter._load_cornac", return_value=fake_cornac()):
+            model = CornacMostPopAdapter().fit_legacy(self.prepared)
+            with patch.object(FakeMostPop, "fit", side_effect=RuntimeError("TEST_ONLY failed fit")):
+                with self.assertRaises(TrainingError):
+                    model.fit_legacy(self.prepared)
+        self.assertFalse(model.is_fitted)
+        self.assertIsNone(model.data_fingerprint)
+        with self.assertRaises(ModelNotFittedError):
+            model.rank_items(0, top_k=10, seen_items=())
 
-            calls.append(result)
-            return result.metrics["NDCG@3"]
+    def test_missing_cornac_cannot_be_silently_substituted(self):
+        with patch("benchmarks.cornac_adapter._load_cornac", side_effect=ImportError("TEST_ONLY absent")):
+            with self.assertRaises(ImportError):
+                CornacMostPopAdapter().fit_legacy(self.prepared)
 
-        return score
-
-    def test_native_models_evaluate_and_export_four_reports(self):
-        models = (
-            PopularityRecommender(),
-            BPRMatrixFactorization(
-                config=self.model_config
-            ),
-        )
-        results = []
-
-        for model in models:
-            started = perf_counter()
-            model.fit(self.splits.train)
-            fit_seconds = perf_counter() - started
-
-            results.append(
-                replace(
-                    self.check_test_result(model),
-                    fit_seconds=fit_seconds,
-                )
-            )
-
-        candidates = tuple(
-            reversed(range(self.splits.train.num_items))
-        )
-        counts = [
-            sum(
-                row.item_id == item and row.rating == 1.0
-                for row in self.splits.train.interactions
-            )
-            for item in candidates
-        ]
-
-        np.testing.assert_allclose(
-            models[0].score_items(0, candidates),
-            counts,
-        )
-
-        metadata = {
-            "purpose": "native_model_integration",
-            "configs": [
-                model.config()
-                for model in models
-            ],
-        }
-
-        with tempfile.TemporaryDirectory() as directory:
-            paths = save_results(
-                results,
-                directory,
-                metadata,
-            )
-            self.assertEqual(
-                set(paths),
-                {"summary", "per_user", "skipped_users", "run_config"},
-            )
-
-            for path in paths.values():
-                self.assertTrue(Path(path).is_file())
-
-            expected_counts = (
-                ("summary", 2),
-                ("per_user", 6),
-                ("skipped_users", 4),
-            )
-            for key, expected_rows in expected_counts:
-                with paths[key].open(
-                    encoding="utf-8",
-                    newline="",
-                ) as stream:
-                    self.assertEqual(
-                        len(list(csv.DictReader(stream))),
-                        expected_rows,
-                    )
-
-            self.assertEqual(
-                json.loads(
-                    paths["run_config"].read_text(
-                        encoding="utf-8"
-                    )
-                ),
-                metadata,
-            )
-
-    def test_bpr_callback_receives_current_public_candidate(self):
-        model = BPRMatrixFactorization(
-            config=self.model_config
-        )
-        calls = []
-
-        model.fit(
-            self.splits.train,
-            validation_score=self.validation_callback(
-                calls
-            ),
-        )
-
-        self.assertTrue(calls)
-        self.assertGreaterEqual(model.best_epoch, 1)
-        self.assertLessEqual(
-            model.best_epoch,
-            self.model_config.n_epochs,
-        )
-        self.check_test_result(model)
-
-    def test_text_bpr_uses_official_train_feature_builder(self):
-        def encode_batch(texts):
-            return np.asarray([
-                [1.0, float(len(text) % 5 + 1)]
-                for text in texts
-            ])
-
-        features, report = build_item_features(
-            self.splits.train,
-            encode_batch,
-            encoder_name="synthetic-test-encoder",
-            encoder_revision="test-v1",
-            batch_size=2,
-        )
-
-        self.assertEqual(report["reviews_used"], 2)
-        self.assertTrue(
-            any(
-                row.rating == 0.0
-                for row in self.splits.train.iter_reviews()
-            )
-        )
-        self.assertEqual(
-            features.train_fingerprint,
-            self.splits.train.fingerprint,
-        )
-        self.assertEqual(
-            features.text_fingerprint,
-            self.splits.train.review_fingerprint,
-        )
-
-        model = TextBPRMatrixFactorization(
-            config=self.model_config
-        )
-        calls = []
-
-        model.fit(
-            self.splits.train,
-            item_features=features,
-            validation_score=self.validation_callback(
-                calls
-            ),
-        )
-
-        self.assertTrue(calls)
-        result = self.check_test_result(model)
-
-        with tempfile.TemporaryDirectory() as directory:
-            paths = save_results(
-                [result],
-                directory,
-                {"feature_report": report},
-            )
-            self.assertTrue(paths["summary"].is_file())
+    def test_real_cornac_fit_and_scores(self):
+        if importlib.util.find_spec("cornac") is None:
+            self.skipTest("Cornac is not installed; this unit smoke does not replace a real benchmark run.")
+        model = CornacMostPopAdapter().fit_legacy(self.prepared)
+        self.assertEqual(type(model._model).__module__.split(".")[0], "cornac")
+        expected = np.bincount(self.prepared.train[:, 1], minlength=self.prepared.num_items)
+        np.testing.assert_array_equal(model.score_items(0, np.arange(self.prepared.num_items)), expected)
+        self.assertTrue(model.metadata()["cornac_version"])
 
 
 if __name__ == "__main__":

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence, Set
+from collections.abc import Callable, Iterable, Mapping, Sequence, Set
 from math import fsum, isfinite
 from numbers import Integral, Real
 from time import perf_counter
 
 import numpy as np
 
-from src.contracts.dto import EvaluationResult, Interaction, SkippedUser, UserEvaluation
+from src.contracts.dto import (
+    EvaluationResult,
+    Interaction,
+    ScoredItem,
+    SkippedUser,
+    UserEvaluation,
+)
 from src.contracts.exceptions import (
     ColdStartError,
     ConfigurationError,
@@ -19,7 +25,13 @@ from src.contracts.exceptions import (
 from src.contracts.interfaces import BaseEvaluator, BaseMetric, InteractionDataset
 
 from .metrics import NDCGAtK, RecallAtK
-from .protocol import EvaluationProtocol, RankingModel, validate_interactions
+from .protocol import (
+    EvaluationProtocol,
+    RankingEvaluationData,
+    RankingModel,
+    RankingProviderProtocol,
+    validate_interactions,
+)
 
 
 __all__ = ["Evaluator"]
@@ -230,6 +242,222 @@ class Evaluator(BaseEvaluator):
             skipped_users=tuple(skipped_users),
             evaluate_seconds=perf_counter() - started,
         )
+
+    def evaluate_rankings(
+        self,
+        model: RankingProviderProtocol,
+        data: RankingEvaluationData,
+        *,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> EvaluationResult:
+        started = perf_counter()
+        model_name = self._validate_ranking_inputs(model, data)
+        per_user = []
+        skipped_users = []
+
+        total_users = len(data.user_ids)
+        if progress is not None and total_users:
+            progress(0, total_users)
+        for processed, raw_user_id in enumerate(data.user_ids):
+            if progress is not None and processed:
+                progress(processed, total_users)
+            user_id = int(raw_user_id)
+            relevant = self._ranking_item_set(
+                data.get_relevant_items(user_id),
+                data.num_items,
+                f"User {user_id} relevant items",
+            )
+            seen = self._ranking_item_set(
+                data.get_seen_items(user_id),
+                data.num_items,
+                f"User {user_id} seen items",
+            )
+            if relevant.intersection(seen):
+                raise DataValidationError(
+                    f"User {user_id} relevant items overlap with known history."
+                )
+
+            has_positive = data.has_positive_train(user_id)
+            if type(has_positive) is not bool:
+                raise DataValidationError("has_positive_train must return a boolean.")
+            if not has_positive:
+                if self.protocol.cold_start_policy == "error":
+                    raise ColdStartError(
+                        f"User {user_id} has no positive training profile.",
+                        user_id=user_id,
+                    )
+                skipped_users.append(SkippedUser(user_id, "no_positive_train"))
+                continue
+
+            if not relevant and self.protocol.empty_ground_truth_policy == "skip":
+                skipped_users.append(SkippedUser(user_id, "empty_ground_truth"))
+                continue
+
+            candidate_count = data.num_items - len(seen)
+            if candidate_count == 0:
+                skipped_users.append(SkippedUser(user_id, "no_candidates"))
+                continue
+
+            ranked_items = model.rank_items(
+                user_id,
+                top_k=self.protocol.max_k,
+                seen_items=seen,
+            )
+            recommended = self._validate_ranking(
+                ranked_items,
+                data.num_items,
+                seen,
+                min(self.protocol.max_k, candidate_count),
+            )
+            values = {}
+            for name, metric in zip(self._metric_names, self.metrics):
+                value = (
+                    metric.compute(
+                        set(relevant),
+                        recommended,
+                        num_total_items=data.num_items,
+                    )
+                    if relevant
+                    else 0.0
+                )
+                if isinstance(value, bool) or not isinstance(value, Real):
+                    raise DataValidationError(f"Metric {name} must return a real scalar.")
+                try:
+                    value = float(value)
+                except (OverflowError, ValueError) as error:
+                    raise DataValidationError(f"Metric {name} must be finite.") from error
+                if not isfinite(value) or not 0.0 <= value <= 1.0:
+                    raise DataValidationError(
+                        f"Metric {name} must return a finite value in [0, 1]."
+                    )
+                values[name] = value
+
+            per_user.append(
+                UserEvaluation(
+                    user_id=user_id,
+                    metrics=values,
+                    recommended_items=recommended,
+                    relevant_items=relevant,
+                    candidate_count=candidate_count,
+                )
+            )
+
+        averages = (
+            {
+                name: fsum(user.metrics[name] for user in per_user) / len(per_user)
+                for name in self._metric_names
+            }
+            if per_user
+            else {}
+        )
+        result = EvaluationResult(
+            model_name=model_name,
+            split_name=data.split_name,
+            metrics=averages,
+            per_user=tuple(per_user),
+            skipped_users=tuple(skipped_users),
+            evaluate_seconds=perf_counter() - started,
+        )
+        if progress is not None and total_users:
+            progress(total_users, total_users)
+        return result
+
+    def _validate_ranking_inputs(
+        self,
+        model: RankingProviderProtocol,
+        data: RankingEvaluationData,
+    ) -> str:
+        if not self.protocol.exclude_seen:
+            raise ConfigurationError("Ranking-provider evaluation requires exclude_seen=True.")
+        if not isinstance(data, RankingEvaluationData):
+            raise DataValidationError("data must be RankingEvaluationData.")
+        if _text(data.split_name, "data.split_name") not in ("validation", "test"):
+            raise DataValidationError("Ranking data split_name must be validation or test.")
+        num_users = _integer(data.num_users, "data.num_users", 1)
+        num_items = _integer(data.num_items, "data.num_items", 1)
+        if not isinstance(data.user_ids, tuple):
+            raise DataValidationError("data.user_ids must be an ordered tuple.")
+        user_ids = tuple(_integer(value, "data.user_ids entry") for value in data.user_ids)
+        if user_ids != tuple(sorted(set(user_ids))):
+            raise DataValidationError("data.user_ids must be sorted and unique.")
+        if any(user_id >= num_users for user_id in user_ids):
+            raise DataValidationError("data.user_ids contains an out-of-range user.")
+        for name in ("get_relevant_items", "get_seen_items", "has_positive_train"):
+            if not callable(getattr(data, name, None)):
+                raise DataValidationError(f"data.{name} must be callable.")
+
+        fingerprint = data.data_fingerprint
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+        ):
+            raise DataValidationError("data_fingerprint must be a lowercase SHA256 hex digest.")
+        model_name = _text(getattr(model, "name", None), "model.name")
+        for name, expected in (("num_users", num_users), ("num_items", num_items)):
+            value = _integer(getattr(model, name, None), f"model.{name}", 1)
+            if value != expected:
+                raise DataValidationError(f"Ranking provider {name} does not match data.")
+        if getattr(model, "data_fingerprint", None) != fingerprint:
+            raise DataValidationError("Ranking provider and data fingerprints must match.")
+        if not callable(getattr(model, "rank_items", None)):
+            raise DataValidationError("Ranking provider must provide rank_items.")
+        return model_name
+
+    @staticmethod
+    def _ranking_item_set(
+        values: frozenset[int],
+        num_items: int,
+        label: str,
+    ) -> frozenset[int]:
+        if not isinstance(values, frozenset):
+            raise DataValidationError(f"{label} must be a frozenset.")
+        for value in values:
+            item_id = _integer(value, label)
+            if item_id >= num_items:
+                raise DataValidationError(f"{label} contains an out-of-range item.")
+        return values
+
+    @staticmethod
+    def _validate_ranking(
+        ranking: Sequence[ScoredItem],
+        num_items: int,
+        seen_items: frozenset[int],
+        expected_count: int,
+    ) -> tuple[int, ...]:
+        if (
+            isinstance(ranking, (str, bytes, bytearray, Mapping))
+            or not isinstance(ranking, Sequence)
+        ):
+            raise DataValidationError("rank_items must return an ordered sequence.")
+        if len(ranking) != expected_count:
+            raise DataValidationError("rank_items must fill the requested available top-K.")
+        item_ids = []
+        returned = set()
+        previous_key = None
+        for entry in ranking:
+            if not isinstance(entry, ScoredItem):
+                raise DataValidationError("rank_items must return shared ScoredItem records.")
+            item_id = _integer(entry.item_idx, "ranked item index")
+            if item_id >= num_items or item_id in seen_items or item_id in returned:
+                raise DataValidationError("Ranked items must be unique, unseen, in-range IDs.")
+            if isinstance(entry.score, bool) or not isinstance(entry.score, Real):
+                raise DataValidationError("Ranked scores must be finite real numbers.")
+            try:
+                score = float(entry.score)
+            except (ValueError, OverflowError) as error:
+                raise DataValidationError("Ranked scores must be finite real numbers.") from error
+            if not isfinite(score):
+                raise DataValidationError("Ranked scores must be finite real numbers.")
+            key = (-score, item_id)
+            if previous_key is not None and key < previous_key:
+                raise DataValidationError(
+                    "Ranked items must use descending scores and ascending IDs for ties."
+                )
+            previous_key = key
+            returned.add(item_id)
+            item_ids.append(item_id)
+        return tuple(item_ids)
 
     @staticmethod
     def _dataset_rows(

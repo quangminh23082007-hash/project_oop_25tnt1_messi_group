@@ -3,10 +3,11 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence, Set
 from importlib import import_module
 from numbers import Integral, Real
+from time import perf_counter
 
 import numpy as np
 
-from src.contracts.dto import Interaction
+from src.contracts.dto import Interaction, ScoredItem
 from src.contracts.exceptions import (
     ConfigurationError,
     DataValidationError,
@@ -138,6 +139,75 @@ class CornacMostPopAdapter(BaseRecommender):
         self._user_map: dict[str, int] = {}
         self._item_map: dict[str, int] = {}
         self._global_scores: np.ndarray | None = None
+        self.data_fingerprint = None
+        self.fit_seconds = 0.0
+        self.load_seconds = 0.0
+        self._cornac_version = None
+
+    def fit_legacy(self, prepared) -> CornacMostPopAdapter:
+        from .legacy_adapter import LegacyPrepared
+
+        self._invalidate()
+        started = perf_counter()
+        try:
+            if not isinstance(prepared, LegacyPrepared):
+                raise DataValidationError("fit_legacy requires verified original prepared data.")
+            positives = prepared.train
+            if not len(positives):
+                raise EmptyDatasetError("Cornac MostPop requires positive train interactions.")
+            cornac = _load_cornac()
+            user_map = {raw_id: index for index, raw_id in enumerate(prepared.user_ids)}
+            item_map = {raw_id: index for index, raw_id in enumerate(prepared.item_ids)}
+            dataset = cornac.data.Dataset(
+                num_users=prepared.num_users,
+                num_items=prepared.num_items,
+                uid_map=user_map,
+                iid_map=item_map,
+                uir_tuple=(positives[:, 0], positives[:, 1], np.ones(len(positives), dtype=float)),
+                seed=self.seed,
+            )
+            model = cornac.models.MostPop(name=self.name)
+            model.fit(dataset)
+            scores = _cornac_scores(model.score(0), prepared.num_items)
+            scores.flags.writeable = False
+            self._model = model
+            self._user_map = user_map
+            self._item_map = item_map
+            self._global_scores = scores
+            self._num_users = prepared.num_users
+            self._num_items = prepared.num_items
+            self.data_fingerprint = prepared.data_fingerprint
+            self.fit_seconds = perf_counter() - started
+            self._cornac_version = getattr(cornac, "__version__", None)
+            self._is_fitted = True
+            return self
+        except BaseException as error:
+            self._invalidate()
+            if isinstance(error, (ConfigurationError, DataValidationError, ImportError)):
+                raise
+            if isinstance(error, Exception):
+                raise TrainingError(f"Cornac MostPop training failed: {error}") from error
+            raise
+
+    def rank_items(self, user_id, *, top_k, seen_items):
+        from .legacy_adapter import _seen_indices
+
+        if not self.is_fitted or self._global_scores is None or self.data_fingerprint is None:
+            raise ModelNotFittedError("Call fit_legacy before rank_items.")
+        self._check_user(user_id)
+        top_k = _integer(top_k, "top_k", 1)
+        seen = _seen_indices(seen_items, self.num_items)
+        candidates = np.fromiter((item for item in range(self.num_items) if item not in seen), dtype=np.int64)
+        order = np.lexsort((candidates, -self._global_scores[candidates]))[:top_k]
+        return tuple(ScoredItem(int(candidates[index]), float(self._global_scores[candidates[index]]))
+                     for index in order)
+
+    def metadata(self):
+        return {"name": self.name, "class": "cornac.models.MostPop", "config": self.config(),
+                "cornac_version": self._cornac_version, "data_fingerprint": self.data_fingerprint,
+                "num_users": self.num_users, "num_items": self.num_items,
+                "fit_seconds": self.fit_seconds, "load_seconds": self.load_seconds,
+                "training_feedback": "distinct positive original TRAIN pairs"}
 
     def fit(
         self,

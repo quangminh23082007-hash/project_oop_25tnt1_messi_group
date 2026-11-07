@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass
 from numbers import Integral, Real
-from typing import Protocol
+from typing import Callable, Protocol
 
-from src.contracts.dto import Interaction
+from src.contracts.dto import Interaction, ScoredItem
 from src.contracts.exceptions import (
     ConfigurationError,
     DataValidationError,
@@ -17,6 +17,8 @@ __all__ = [
     "Interaction",
     "EvaluationProtocol",
     "RankingModel",
+    "RankingEvaluationData",
+    "RankingProviderProtocol",
     "validate_interactions",
 ]
 
@@ -141,6 +143,34 @@ class RankingModel(Protocol):
         user_id: int,
         item_ids: Sequence[int],
     ) -> Iterable[float]:
+        ...
+
+
+@dataclass(frozen=True)
+class RankingEvaluationData:
+    split_name: str
+    num_users: int
+    num_items: int
+    user_ids: tuple[int, ...]
+    get_relevant_items: Callable[[int], frozenset[int]]
+    get_seen_items: Callable[[int], frozenset[int]]
+    has_positive_train: Callable[[int], bool]
+    data_fingerprint: str
+
+
+class RankingProviderProtocol(Protocol):
+    name: str
+    num_users: int
+    num_items: int
+    data_fingerprint: str
+
+    def rank_items(
+        self,
+        user_id: int,
+        *,
+        top_k: int,
+        seen_items: frozenset[int],
+    ) -> Sequence[ScoredItem]:
         ...
 
 

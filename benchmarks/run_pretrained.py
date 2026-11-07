@@ -8,7 +8,7 @@ import platform
 import re
 import sys
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from importlib import metadata
 from numbers import Integral, Real
 from pathlib import Path
@@ -296,22 +296,253 @@ def run_pretrained(config_path, *, user_ids=None, output_dir=None):
     )
 
 
+def _benchmark_integer(value, name):
+    if type(value) is not int or value < 0:
+        raise PretrainedReportError(f"{name} must be a nonnegative integer.")
+    return value
+
+
+def _benchmark_config(config_path, split, max_users, output_dir):
+    config_file = _path(config_path)
+    config, checksum = _read_object(config_file)
+    required = {"run_name", "prepared_dir", "models", "protocol", "benchmark", "output_dir"}
+    if set(config) != required:
+        raise PretrainedReportError(f"Benchmark config must contain exactly {sorted(required)}.")
+    requested = json.loads(json.dumps(config))
+    if not isinstance(config["run_name"], str) or re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", config["run_name"]
+    ) is None:
+        raise PretrainedReportError("Invalid benchmark run_name.")
+    protocol = config["protocol"]
+    if not isinstance(protocol, dict) or set(protocol) != {"ks"} or not isinstance(protocol["ks"], list):
+        raise PretrainedReportError("protocol must contain a ks list.")
+    from src.evaluation import EvaluationProtocol
+    evaluation_protocol = EvaluationProtocol(ks=tuple(protocol["ks"]))
+    options = config["benchmark"]
+    if not isinstance(options, dict) or set(options) != {"split", "max_users", "seed"}:
+        raise PretrainedReportError("benchmark must contain split, max_users and seed.")
+    if split is not None:
+        options["split"] = split
+    if max_users is not None:
+        options["max_users"] = max_users
+    if options["split"] not in ("validation", "test"):
+        raise PretrainedReportError("Benchmark split must be validation or test.")
+    _benchmark_integer(options["max_users"], "max_users")
+    seed = _benchmark_integer(options["seed"], "seed")
+    if seed > 2**32 - 1:
+        raise PretrainedReportError("seed must not exceed 2**32 - 1.")
+    models = config["models"]
+    if not isinstance(models, list) or not models:
+        raise PretrainedReportError("models must be a nonempty list.")
+    labels, kinds = set(), []
+    for spec in models:
+        if not isinstance(spec, dict):
+            raise PretrainedReportError("Each model specification must be an object.")
+        kind = spec.get("kind")
+        if kind not in ("bpr", "text_bpr", "cornac_most_pop"):
+            raise PretrainedReportError("Supported benchmark kinds: bpr, text_bpr, cornac_most_pop.")
+        fields = {"kind", "name"} if kind == "cornac_most_pop" else {"kind", "name", "model_dir"}
+        if set(spec) != fields:
+            raise PretrainedReportError(f"{kind} model fields must be {sorted(fields)}.")
+        label = spec["name"]
+        if not isinstance(label, str) or not label.strip() or label in labels:
+            raise PretrainedReportError("Model names must be nonempty and unique.")
+        labels.add(label)
+        kinds.append(kind)
+        if kind != "cornac_most_pop":
+            spec["model_dir"] = str(_path(spec["model_dir"]))
+    if "cornac_most_pop" not in kinds:
+        raise PretrainedReportError("The benchmark requires an actual Cornac MostPop model.")
+    if not any(kind in ("bpr", "text_bpr") for kind in kinds):
+        raise PretrainedReportError("The benchmark requires a saved model from the project.")
+    config["prepared_dir"] = str(_path(config["prepared_dir"]))
+    config["output_dir"] = str(_path(config["output_dir"] if output_dir is None else output_dir))
+    output = Path(config["output_dir"])
+    if output.exists() and not output.is_dir():
+        raise PretrainedReportError("output_dir must point to a directory.")
+    return config_file, checksum, requested, config, evaluation_protocol
+
+
+def _ranking_cohort(result):
+    digest = hashlib.sha256()
+    for row in result.per_user:
+        digest.update(json.dumps(
+            [row.user_id, row.candidate_count, sorted(row.relevant_items)],
+            separators=(",", ":"),
+        ).encode("utf-8"))
+    for row in result.skipped_users:
+        digest.update(json.dumps(
+            [row.user_id, row.reason], separators=(",", ":")
+        ).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _make_progress_reporter(model_name):
+    started = perf_counter()
+    last_print = started
+
+    def report(processed, total):
+        nonlocal last_print
+        now = perf_counter()
+        if 0 < processed < total and now - last_print < 10:
+            return
+        percentage = (processed * 1000 // total) / 10
+        elapsed = timedelta(seconds=int(now - started))
+        print(
+            f"{model_name} | {percentage:5.1f}% | "
+            f"{processed:,}/{total:,} users | elapsed {elapsed}",
+            flush=True,
+        )
+        last_print = now
+
+    return report
+
+
+def run_benchmark(config_path, *, split=None, max_users=None, output_dir=None):
+    from dataclasses import replace
+    from uuid import uuid4
+
+    from src.evaluation import Evaluator
+    from src.evaluation.result import save_results
+
+    from .cornac_adapter import CornacMostPopAdapter, _load_cornac
+    from .legacy_adapter import LegacyPrepared, SavedModelRanker
+
+    config_file, config_sha256, requested, config, protocol = _benchmark_config(
+        config_path, split, max_users, output_dir
+    )
+    started = perf_counter()
+    _load_cornac()
+    prepared = LegacyPrepared.load(config["prepared_dir"])
+    preparation_seconds = perf_counter() - started
+    options = config["benchmark"]
+    context = prepared.context(
+        options["split"], max_users=options["max_users"], seed=options["seed"]
+    )
+    if not context.user_ids:
+        raise PretrainedReportError("No users with positive ground truth exist in the selected split.")
+    evaluator = Evaluator(protocol)
+    results, model_reports = [], []
+    cohort = None
+    for spec in config["models"]:
+        print(f"Preparing {spec['name']}...", flush=True)
+        started = perf_counter()
+        fit_seconds = 0.0
+        load_seconds = 0.0
+        if spec["kind"] == "cornac_most_pop":
+            provider = CornacMostPopAdapter(name=spec["name"], seed=options["seed"])
+            provider.fit_legacy(prepared)
+            fit_seconds = perf_counter() - started
+        else:
+            provider = SavedModelRanker.load(
+                spec["model_dir"], prepared, name=spec["name"]
+            )
+            load_seconds = perf_counter() - started
+            if provider.model_type != MODEL_TYPES[spec["kind"]]:
+                raise PretrainedReportError(
+                    f"{spec['name']} bundle type does not match {spec['kind']}."
+                )
+        print(f"Evaluating {spec['name']}: {len(context.user_ids):,} selected users...", flush=True)
+        progress = _make_progress_reporter(spec['name'])
+        result = evaluator.evaluate_rankings(provider, context, progress=progress)
+        if not result.per_user:
+            raise PretrainedReportError(f"No users were evaluated for {spec['name']}.")
+        signature = _ranking_cohort(result)
+        if cohort is not None and cohort != signature:
+            raise PretrainedReportError("Models were not scored on identical users/candidates/ground truth.")
+        cohort = signature
+        results.append(replace(result, fit_seconds=fit_seconds))
+        model_reports.append({
+            "name": spec["name"],
+            "kind": spec["kind"],
+            "load_seconds": load_seconds,
+            "fit_seconds": fit_seconds,
+            "evaluate_seconds": result.evaluate_seconds,
+            "retrained_project_model": False,
+            "source": provider.metadata(),
+        })
+        print(
+            f"{spec['name']}: users={len(result.per_user)}, metrics={result.metrics}",
+            flush=True,
+        )
+        del provider
+    print('Preparing benchmark reports...', flush=True)
+    created = datetime.now(timezone.utc)
+    destination = Path(config["output_dir"]) / (
+        f"{config['run_name']}_{options['split']}_"
+        f"{created.strftime('%Y%m%dT%H%M%S%fZ')}_{uuid4().hex[:8]}"
+    )
+    versions = {"python": platform.python_version()}
+    for package in ("numpy", "scipy", "cornac"):
+        try:
+            versions[package] = metadata.version(package)
+        except metadata.PackageNotFoundError:
+            versions[package] = None
+    data_metadata = prepared.metadata()
+    run_metadata = {
+        "created_at_utc": created.isoformat(),
+        "mode": "benchmark",
+        "recomputed_metrics": True,
+        "config_file": str(config_file),
+        "config_sha256": config_sha256,
+        "requested_config": requested,
+        "effective_config": config,
+        "versions": versions,
+        "data": data_metadata,
+        "preparation_seconds": preparation_seconds,
+        "evaluation": {
+            "split": options["split"],
+            "ks": list(protocol.ks),
+            "max_users": options["max_users"],
+            "seed": options["seed"],
+            "selected_user_count": len(context.user_ids),
+            "eligible_user_count": data_metadata["eligible_users"][options["split"]],
+            "eligible_count_definition": "source users with positive mapped targets before evaluator profile/empty-candidate policies",
+            "evaluated_user_count": len(results[0].per_user),
+            "skipped_user_count": len(results[0].skipped_users),
+            "history": "train_seen" if options["split"] == "validation" else "validation_seen",
+            "candidate_policy": "full original mapped catalog minus split-specific observed history",
+            "tie_break": "descending score, then ascending original internal item index",
+            "aggregation": "macro mean across evaluated users",
+            "cohort_sha256": cohort,
+        },
+        "models": model_reports,
+        "output_directory": str(destination),
+    }
+    return save_results(results, destination, run_metadata)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Run CPU recommendations and import original validation reports."
+        description="Run recommendations or benchmark saved models against Cornac."
     )
-    parser.add_argument(
-        "--config", default=str(ROOT / "configs" / "evaluation_pretrained.json")
-    )
+    parser.add_argument("--mode", choices=("recommend", "benchmark"), default="recommend")
+    parser.add_argument("--config")
     parser.add_argument("--user", action="append", dest="user_ids")
     parser.add_argument("--output-dir")
+    parser.add_argument("--split", choices=("validation", "test"))
+    parser.add_argument("--max-users", type=int)
     args = parser.parse_args(argv)
-    try:
-        paths = run_pretrained(
-            args.config, user_ids=args.user_ids, output_dir=args.output_dir
+    config_path = args.config or str(
+        ROOT / "configs" / (
+            "benchmark.json" if args.mode == "benchmark" else "evaluation_pretrained.json"
         )
+    )
+    try:
+        if args.mode == "benchmark":
+            if args.user_ids is not None:
+                raise PretrainedReportError("--user belongs to recommend mode; benchmark chooses one shared cohort.")
+            paths = run_benchmark(
+                config_path, split=args.split, max_users=args.max_users, output_dir=args.output_dir
+            )
+        else:
+            if args.split is not None or args.max_users is not None:
+                raise PretrainedReportError("--split and --max-users belong to benchmark mode.")
+            paths = run_pretrained(
+                config_path, user_ids=args.user_ids, output_dir=args.output_dir
+            )
     except Exception as error:
-        print(f"Pretrained run failed: {error}", file=sys.stderr)
+        print(f"Evaluation run failed: {error}", file=sys.stderr)
         return 1
     for name, path in paths.items():
         print(f"{name}: {path}")

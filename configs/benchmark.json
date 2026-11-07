@@ -1,0 +1,32 @@
+{
+  "run_name": "game_recommender_benchmark",
+  "prepared_dir": "artifacts/prepared_original",
+  "models": [
+    {
+      "kind": "bpr",
+      "name": "BPR",
+      "model_dir": "artifacts/models/bpr/cpu"
+    },
+    {
+      "kind": "text_bpr",
+      "name": "TextBPR",
+      "model_dir": "artifacts/models/text_bpr/cpu"
+    },
+    {
+      "kind": "cornac_most_pop",
+      "name": "CornacMostPop"
+    }
+  ],
+  "protocol": {
+    "ks": [
+      5,
+      10
+    ]
+  },
+  "benchmark": {
+    "split": "test",
+    "max_users": 0,
+    "seed": 42
+  },
+  "output_dir": "results/benchmark"
+}
