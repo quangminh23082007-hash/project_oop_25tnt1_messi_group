@@ -1,0 +1,907 @@
+"""Pretrained service facade and runtime backend for production / UI inference.
+
+Supports:
+1. Native PretrainedRecommender bundles (Contracts v1.1 CPU inference without retrain).
+2. Adapter mode for BaseRecommender models and custom metadata mappings.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from importlib import import_module
+from numbers import Integral, Real
+from pathlib import Path
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set
+import numpy as np
+
+from src.contracts.dto import GameItem, Interaction, RecommendationResult, ScoredItem
+from src.contracts.exceptions import (
+    ColdStartError,
+    ConfigurationError,
+    DataValidationError,
+    InvalidParameterError,
+    ModelNotFittedError,
+    RecSysError,
+    UnknownItemError,
+    UnknownUserError,
+)
+from src.contracts.interfaces import (
+    BaseRecommender,
+    IdMapper,
+    checked_indices,
+    checked_scores,
+)
+from src.service.filters import FilterCriteria, game_passes_filters, parse_filter_criteria
+from src.service.formatters import format_recommendations_table
+from src.service.mappers import to_recommendation_result
+from src.service.validators import (
+    model_matches_dataset,
+    validate_dataset,
+    validate_fallback_model,
+    validate_id,
+    validate_top_k,
+)
+
+
+class SimpleIdMapper:
+    """Minimal IdMapper implementation for wrapping sequence of raw IDs."""
+
+    def __init__(self, raw_ids: Sequence[str]) -> None:
+        self._raw_ids = tuple(str(r) for r in raw_ids)
+        self._raw_to_idx = {r: i for i, r in enumerate(self._raw_ids)}
+        self.size = len(self._raw_ids)
+
+    def contains_raw(self, raw_id: str) -> bool:
+        return raw_id in self._raw_to_idx
+
+    def to_idx(self, raw_id: str) -> int:
+        return self._raw_to_idx[raw_id]
+
+    def to_raw(self, index: int) -> str:
+        return self._raw_ids[index]
+
+
+class PretrainedDatasetProxy:
+    """Read-only catalog/history wrapper for demos or explicit source data.
+
+    When ``interactions`` is omitted this object is metadata-only and has
+    ``split_name == 'metadata'``; it must not be passed to model training or
+    evaluation as an ``InteractionDataset``.
+    """
+
+    def __init__(
+        self,
+        user_mapper: IdMapper,
+        item_mapper: IdMapper,
+        catalog: Dict[str, GameItem],
+        user_seen_items: Dict[int, Set[int]],
+        user_positive_items: Optional[Dict[int, Set[int]]] = None,
+        mapping_fingerprint: str = "mfp-pretrained",
+        fingerprint: str = "fp-pretrained",
+        review_fingerprint: str = "rfp-pretrained",
+        interactions: Optional[Sequence[Interaction]] = None,
+        provenance: Optional[dict] = None,
+    ) -> None:
+        self.is_source_dataset = interactions is not None
+        self.split_name = "train" if self.is_source_dataset else "metadata"
+        self.user_mapper = user_mapper
+        self.item_mapper = item_mapper
+        self.num_users = user_mapper.size
+        self.num_items = item_mapper.size
+        self.mapping_fingerprint = mapping_fingerprint if self.is_source_dataset else None
+        self.fingerprint = fingerprint if self.is_source_dataset else None
+        self.review_fingerprint = review_fingerprint if self.is_source_dataset else None
+
+        self._catalog = dict(catalog)
+        self._user_seen = {u: frozenset(items) for u, items in user_seen_items.items()}
+        self._user_pos = (
+            {u: frozenset(items) for u, items in user_positive_items.items()}
+            if user_positive_items is not None
+            else self._user_seen
+        )
+
+        # A pretrained bundle is not a substitute for the source train dataset.
+        # Preserve bundle interactions when they are explicitly supplied, but
+        # never invent rows from model history and present them as source data.
+        self.interactions: Sequence[Interaction] = (
+            tuple(interactions) if interactions is not None else ()
+        )
+        self.num_interactions = len(self.interactions)
+        self.provenance = dict(provenance or {})
+
+    def get_game_by_raw_id(self, raw_game_id: str) -> GameItem:
+        if raw_game_id not in self._catalog:
+            raise UnknownItemError(f"Game '{raw_game_id}' is not in catalog.")
+        return self._catalog[raw_game_id]
+
+    def get_user_seen_items(self, user_id: int) -> FrozenSet[int]:
+        return self._user_seen.get(user_id, frozenset())
+
+    def get_user_positive_items(self, user_id: int) -> FrozenSet[int]:
+        return self._user_pos.get(user_id, frozenset())
+
+    def iter_reviews(self) -> Iterable[Any]:
+        return iter(())
+
+
+def _is_pretrained_recommender(obj: Any) -> bool:
+    if obj is None:
+        return False
+    if obj.__class__.__name__ == "PretrainedRecommender":
+        return True
+    return (
+        hasattr(obj, "recommend_games")
+        and hasattr(obj, "get_user_played_games")
+        and hasattr(obj, "get_game_details")
+        and not isinstance(obj, BaseRecommender)
+    )
+
+
+class PretrainedServiceFacade:
+    """Production and UI facade coordinating inference from pre-trained model bundles.
+
+    Supports both:
+    1. Real PretrainedRecommender instances from src.models.pretrained (Contracts v1.1).
+    2. BaseRecommender instances with explicit mapper/catalog metadata (Adapter mode).
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        user_mapper: Optional[IdMapper] = None,
+        item_mapper: Optional[IdMapper] = None,
+        catalog: Optional[Dict[str, GameItem]] = None,
+        user_seen_items: Optional[Dict[int, Set[int]]] = None,
+        user_positive_items: Optional[Dict[int, Set[int]]] = None,
+        *,
+        fallback_model: Optional[BaseRecommender] = None,
+        allow_cold_start_fallback: bool = False,
+        mapping_fingerprint: str = "mfp-pretrained",
+        train_fingerprint: str = "fp-pretrained",
+        catalog_lookup: Optional[Callable[[str], GameItem]] = None,
+        train_dataset: Optional[Any] = None,
+    ) -> None:
+        if isinstance(model, (str, Path)):
+            facade = self.load(
+                model,
+                allow_cold_start_fallback=allow_cold_start_fallback,
+                catalog_lookup=catalog_lookup,
+                train_dataset=train_dataset,
+            )
+            self._is_native = True
+            self._recommender = facade._recommender
+            self._model = facade._recommender
+            self._allow_cold_start_fallback = allow_cold_start_fallback
+            self._extra_seen_raw: Dict[str, Set[str]] = defaultdict(set)
+            self._source_dataset: Optional[Any] = (
+                train_dataset
+                if train_dataset is not None
+                else self._source_dataset_from_recommender(self._recommender)
+            )
+            self._fallback_model = getattr(self._recommender, "_popularity", None)
+            self._validate_source_dataset_if_present()
+            return
+
+        is_native = _is_pretrained_recommender(model) or (
+            user_mapper is None and hasattr(model, "recommend_games") and hasattr(model, "get_game_details")
+        )
+
+        if is_native:
+            self._is_native = True
+            self._recommender = model
+            self._model = model
+            self._allow_cold_start_fallback = allow_cold_start_fallback
+            if hasattr(model, "allow_cold_start_fallback"):
+                model.allow_cold_start_fallback = allow_cold_start_fallback
+            self._extra_seen_raw = defaultdict(set)
+            self._source_dataset = (
+                train_dataset
+                if train_dataset is not None
+                else self._source_dataset_from_recommender(model)
+            )
+            self._fallback_model = getattr(model, "_popularity", None)
+            self._validate_source_dataset_if_present()
+        else:
+            if not isinstance(model, BaseRecommender):
+                raise InvalidParameterError("model must be an instance of BaseRecommender or PretrainedRecommender.")
+            if not bool(getattr(model, "is_fitted", False)):
+                raise ModelNotFittedError(f"Model '{model.name}' must be fitted before initialization.")
+            if (
+                catalog is None
+                or user_seen_items is None
+                or (train_dataset is None and (user_mapper is None or item_mapper is None))
+            ):
+                raise InvalidParameterError(
+                    "catalog and user_seen_items are required; user/item mappers are also required "
+                    "when train_dataset is not supplied."
+                )
+
+            self._is_native = False
+            self._recommender = None
+            self._model = model
+            self._fallback_model = fallback_model
+            self._allow_cold_start_fallback = allow_cold_start_fallback
+            self._source_dataset = train_dataset
+            self._validate_source_dataset_if_present()
+            if self._source_dataset is not None:
+                # The fitted train dataset owns the canonical raw<->internal
+                # order. Never trust a separately supplied mapper to replace it.
+                self._user_mapper = self._source_dataset.user_mapper
+                self._item_mapper = self._source_dataset.item_mapper
+            else:
+                self._user_mapper = user_mapper
+                self._item_mapper = item_mapper
+            self._catalog = dict(catalog)
+            self._mapping_fingerprint = mapping_fingerprint
+            self._train_fingerprint = train_fingerprint
+            self._validate_adapter_mappers()
+            if self._source_dataset is None and not self._model_matches_adapter(self._model):
+                raise DataValidationError(
+                    "model dimensions/fingerprints do not match the adapter mapping metadata."
+                )
+            if self._source_dataset is not None:
+                # Histories must use the same internal IDs as the canonical
+                # train mapper, just like the model itself.
+                self._user_seen_items = {
+                    user_idx: set(self._source_dataset.get_user_seen_items(user_idx))
+                    for user_idx in range(self._source_dataset.num_users)
+                }
+                self._user_positive_items = {
+                    user_idx: set(self._source_dataset.get_user_positive_items(user_idx))
+                    for user_idx in range(self._source_dataset.num_users)
+                }
+            else:
+                self._user_seen_items = {u: set(items) for u, items in user_seen_items.items()}
+                self._user_positive_items = (
+                    {u: set(items) for u, items in user_positive_items.items()}
+                    if user_positive_items is not None
+                    else {u: set(items) for u, items in user_seen_items.items()}
+                )
+            self._extra_seen: Dict[int, Set[int]] = defaultdict(set)
+            self._extra_seen_raw = defaultdict(set)
+            self._validate_adapter_histories()
+
+            if self._source_dataset is not None and not model_matches_dataset(self._model, self._source_dataset):
+                raise DataValidationError(
+                    "model dimensions/fingerprints do not match the provided train_dataset."
+                )
+            if self._source_dataset is not None:
+                self._mapping_fingerprint = self._source_dataset.mapping_fingerprint
+                self._train_fingerprint = self._source_dataset.fingerprint
+
+            if fallback_model is not None:
+                validate_fallback_model(fallback_model)
+                if not bool(getattr(fallback_model, "is_fitted", False)):
+                    if self._source_dataset is None:
+                        raise ModelNotFittedError(
+                            "fallback_model must be fitted, or a real train_dataset must be supplied."
+                        )
+                    self._fit_fallback(fallback_model, self._source_dataset)
+                elif self._source_dataset is not None and not model_matches_dataset(
+                    fallback_model, self._source_dataset
+                ):
+                    raise DataValidationError(
+                        "fallback_model dimensions/fingerprints do not match the provided train_dataset."
+                    )
+                elif self._source_dataset is None and not self._model_matches_adapter(fallback_model):
+                    raise DataValidationError(
+                        "fallback_model dimensions/fingerprints do not match the adapter mapping metadata."
+                    )
+            elif allow_cold_start_fallback:
+                raise ConfigurationError(
+                    "allow_cold_start_fallback=True requires a configured fallback_model in adapter mode."
+                )
+
+    @classmethod
+    def load(
+        cls,
+        folder: Any,
+        *,
+        allow_cold_start_fallback: bool = False,
+        catalog_lookup: Optional[Callable[[str], GameItem]] = None,
+        train_dataset: Optional[Any] = None,
+    ) -> "PretrainedServiceFacade":
+        """Load a trained model bundle and return a PretrainedServiceFacade."""
+        for module_name in (
+            "src.models.pretrained",
+            "src.models",
+            "models.pretrained",
+            "models",
+        ):
+            try:
+                mod = import_module(module_name)
+                rec_cls = getattr(mod, "PretrainedRecommender", None)
+                if rec_cls is not None and hasattr(rec_cls, "load"):
+                    recommender = rec_cls.load(
+                        folder,
+                        allow_cold_start_fallback=allow_cold_start_fallback,
+                        catalog_lookup=catalog_lookup,
+                    )
+                    return cls(
+                        recommender,
+                        allow_cold_start_fallback=allow_cold_start_fallback,
+                        train_dataset=train_dataset,
+                    )
+            except (ImportError, AttributeError):
+                continue
+        raise ConfigurationError(
+            "PretrainedRecommender is not available. Ensure src.models.pretrained is importable."
+        )
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        folder: Any,
+        *,
+        allow_cold_start_fallback: bool = False,
+        catalog_lookup: Optional[Callable[[str], GameItem]] = None,
+        train_dataset: Optional[Any] = None,
+    ) -> "PretrainedServiceFacade":
+        """Alias for PretrainedServiceFacade.load."""
+        return cls.load(
+            folder,
+            allow_cold_start_fallback=allow_cold_start_fallback,
+            catalog_lookup=catalog_lookup,
+            train_dataset=train_dataset,
+        )
+
+    @property
+    def model(self) -> Any:
+        return self._recommender if self._is_native else self._model
+
+    @property
+    def model_name(self) -> str:
+        if self._is_native:
+            return getattr(self._recommender, "model_name", self._recommender.__class__.__name__)
+        return self._model.name
+
+    @property
+    def fallback_model(self) -> Optional[Any]:
+        if self._is_native:
+            return getattr(self._recommender, "_popularity", getattr(self, "_fallback_model", None))
+        return self._fallback_model
+
+    @property
+    def allow_cold_start_fallback(self) -> bool:
+        if self._is_native and hasattr(self._recommender, "allow_cold_start_fallback"):
+            return bool(self._recommender.allow_cold_start_fallback)
+        return self._allow_cold_start_fallback
+
+    @allow_cold_start_fallback.setter
+    def allow_cold_start_fallback(self, value: bool) -> None:
+        if not isinstance(value, bool):
+            raise InvalidParameterError("allow_cold_start_fallback must be boolean.")
+        if value and not self._is_native and self._fallback_model is None:
+            raise ConfigurationError(
+                "allow_cold_start_fallback=True requires a configured fallback_model in adapter mode."
+            )
+        self._allow_cold_start_fallback = value
+        if self._is_native and hasattr(self._recommender, "allow_cold_start_fallback"):
+            self._recommender.allow_cold_start_fallback = value
+
+    @property
+    def provenance(self) -> dict:
+        if self._is_native:
+            return getattr(self._recommender, "provenance", {})
+        return {
+            "protocol": "service-adapter-v1",
+            "mapping_fingerprint": getattr(self, "_mapping_fingerprint", None),
+            "train_fingerprint": getattr(self, "_train_fingerprint", None),
+        }
+
+    @property
+    def metadata(self) -> dict:
+        """Return bundle/adapter metadata without presenting it as a dataset."""
+        if self._is_native:
+            return dict(getattr(self._recommender, "provenance", {}) or {})
+        return self.provenance
+
+    @property
+    def dataset(self) -> Any:
+        """Return the real train dataset, never a synthetic metadata proxy."""
+        if self._source_dataset is None:
+            raise ConfigurationError(
+                "This pretrained facade has metadata only; provide the original train_dataset "
+                "for training or evaluation."
+            )
+        return self._source_dataset
+
+    def _validate_source_dataset_if_present(self) -> None:
+        if self._source_dataset is None:
+            return
+        source_dataset = self._source_dataset
+        if hasattr(source_dataset, "train") and hasattr(source_dataset, "validation") and hasattr(source_dataset, "test"):
+            source_dataset = source_dataset.train
+            self._source_dataset = source_dataset
+        validate_dataset(source_dataset, "train")
+        if source_dataset.split_name != "train":
+            raise DataValidationError("train_dataset must have split_name='train'.")
+        if source_dataset.num_interactions == 0:
+            raise EmptyDatasetError("train_dataset contains zero interactions.")
+
+    @staticmethod
+    def _fit_fallback(fallback_model: BaseRecommender, train_dataset: Any) -> None:
+        try:
+            fallback_model.fit(train_dataset)
+        except RecSysError:
+            raise
+        except Exception as exc:
+            raise ConfigurationError(f"Fallback model training failed: {exc}") from exc
+        if not model_matches_dataset(fallback_model, train_dataset):
+            raise DataValidationError(
+                "fallback_model did not finish fitted with the train dimensions/fingerprints."
+            )
+
+    def _validate_adapter_mappers(self) -> None:
+        for name, mapper in (("user_mapper", self._user_mapper), ("item_mapper", self._item_mapper)):
+            size = getattr(mapper, "size", None)
+            if (
+                isinstance(size, bool)
+                or not isinstance(size, Integral)
+                or size < 0
+                or not callable(getattr(mapper, "contains_raw", None))
+                or not callable(getattr(mapper, "to_idx", None))
+                or not callable(getattr(mapper, "to_raw", None))
+            ):
+                raise DataValidationError(f"{name} does not satisfy IdMapper.")
+            raw_ids = []
+            for index in range(int(size)):
+                try:
+                    raw_id = mapper.to_raw(index)
+                    round_trip = mapper.to_idx(raw_id)
+                    contains = mapper.contains_raw(raw_id)
+                except Exception as exc:
+                    raise DataValidationError(
+                        f"{name} cannot round-trip internal index {index}."
+                    ) from exc
+                if not isinstance(raw_id, str) or not raw_id.strip() or round_trip != index or not contains:
+                    raise DataValidationError(f"{name} has an invalid raw/internal ID order.")
+                raw_ids.append(raw_id)
+            if len(set(raw_ids)) != len(raw_ids):
+                raise DataValidationError(f"{name} contains duplicate raw IDs.")
+
+    def _model_matches_adapter(self, model: BaseRecommender) -> bool:
+        return (
+            bool(getattr(model, "is_fitted", False))
+            and getattr(model, "num_users", None) == self._user_mapper.size
+            and getattr(model, "num_items", None) == self._item_mapper.size
+            and getattr(model, "mapping_fingerprint", None) == self._mapping_fingerprint
+            and getattr(model, "train_fingerprint", None) == self._train_fingerprint
+        )
+
+    def _validate_adapter_histories(self) -> None:
+        for mapping_name, histories, limit in (
+            ("user_seen_items", self._user_seen_items, self._item_mapper.size),
+            ("user_positive_items", self._user_positive_items, self._item_mapper.size),
+        ):
+            for user_idx, item_ids in histories.items():
+                if (
+                    isinstance(user_idx, bool)
+                    or not isinstance(user_idx, Integral)
+                    or user_idx < 0
+                    or user_idx >= self._user_mapper.size
+                ):
+                    raise DataValidationError(f"{mapping_name} contains an invalid user index.")
+                checked_indices(list(item_ids), limit)
+
+    @classmethod
+    def _source_dataset_from_recommender(cls, recommender: Any) -> Optional[Any]:
+        """Return the original train dataset when the bundle exposes it.
+
+        A model's internal history is not sufficient to recreate the source
+        dataset: it loses split-specific fingerprints, review text and
+        timestamps.  Only accept an explicitly attached train dataset here.
+        """
+        for attr_name in ("train_dataset", "_train_dataset", "dataset", "_dataset"):
+            candidate = getattr(recommender, attr_name, None)
+            if candidate is not None and getattr(candidate, "split_name", None) == "train":
+                return candidate
+        return None
+
+    @classmethod
+    def _build_dataset_proxy_from_recommender(cls, recommender: Any) -> PretrainedDatasetProxy:
+        user_ids = tuple(getattr(recommender, "_users", {}).keys())
+        item_ids = tuple(getattr(recommender, "_items", ()))
+        user_mapper = SimpleIdMapper(user_ids)
+        item_mapper = SimpleIdMapper(item_ids)
+
+        catalog: Dict[str, GameItem] = {}
+        for gid in item_ids:
+            try:
+                game = recommender.get_game_details(gid)
+            except (KeyError, IndexError, UnknownItemError):
+                continue
+            if isinstance(game, GameItem):
+                catalog[gid] = game
+
+        provenance = getattr(recommender, "provenance", {}) or {}
+        mapping_fp = provenance.get("mapping_fingerprint") or provenance.get("mapping_fp")
+        train_fp = provenance.get("train_fingerprint") or provenance.get("train_fp")
+        data_fp = provenance.get("data_fingerprint")
+        review_fp = provenance.get("review_fingerprint") or provenance.get("text_fingerprint")
+
+        # Some legacy bundles expose only one data fingerprint. Keep it as a
+        # fallback identifier, but do not manufacture a review fingerprint.
+        mapping_fp = mapping_fp or data_fp or "mfp-pretrained"
+        train_fp = train_fp or data_fp or "fp-pretrained"
+        review_fp = review_fp or "rfp-unavailable"
+
+        return PretrainedDatasetProxy(
+            user_mapper=user_mapper,
+            item_mapper=item_mapper,
+            catalog=catalog,
+            user_seen_items={},
+            mapping_fingerprint=mapping_fp,
+            fingerprint=train_fp,
+            review_fingerprint=review_fp,
+            provenance=provenance,
+        )
+
+    @staticmethod
+    def _normalize_extra_seen(extra_seen: Any) -> Set[str]:
+        if not extra_seen:
+            return set()
+        if isinstance(extra_seen, (str, bytes)):
+            raise InvalidParameterError("extra_seen must be a collection of original game IDs")
+        try:
+            values = {str(game_id).strip() for game_id in extra_seen if str(game_id).strip()}
+        except TypeError as exc:
+            raise InvalidParameterError("extra_seen must be a collection of original game IDs") from exc
+        return values
+
+    def _item_indices_for_raw_ids(self, raw_ids: Iterable[str]) -> Set[int]:
+        if self._is_native:
+            item_map = getattr(self._recommender, "_item_map", {})
+            return {int(item_map[raw_id]) for raw_id in raw_ids if raw_id in item_map}
+        return {
+            int(self._item_mapper.to_idx(raw_id))
+            for raw_id in raw_ids
+            if self._item_mapper.contains_raw(raw_id)
+        }
+
+    def _try_get_catalog_game(self, raw_game_id: str) -> Optional[GameItem]:
+        try:
+            game = self.get_game_details(raw_game_id)
+        except (KeyError, IndexError, UnknownItemError):
+            return None
+        if not isinstance(game, GameItem):
+            raise DataValidationError("catalog lookup must return a GameItem instance.")
+        return game
+
+    def record_user_interaction(
+        self,
+        raw_user_id: str,
+        raw_game_id: str,
+        rating: float = 1.0,
+    ) -> None:
+        """Record dynamic runtime interaction (extra_seen) from session/UI."""
+        raw_user_id = validate_id(raw_user_id, "raw_user_id")
+        raw_game_id = validate_id(raw_game_id, "raw_game_id")
+        if isinstance(rating, bool) or not isinstance(rating, Real) or float(rating) not in (0.0, 1.0):
+            raise InvalidParameterError("rating must be exactly 0.0 or 1.0.")
+
+        if self._is_native:
+            if hasattr(self._recommender, "_items") and raw_game_id not in getattr(self._recommender, "_item_map", set(self._recommender._items)):
+                raise UnknownItemError(f"Game '{raw_game_id}' is not in item mapper.")
+            # Runtime history belongs to the session, not to the fitted
+            # mapping.  This deliberately accepts a new UI user.
+            self._extra_seen_raw[raw_user_id].add(raw_game_id)
+        else:
+            if not self._item_mapper.contains_raw(raw_game_id):
+                raise UnknownItemError(f"Game '{raw_game_id}' is not in item mapper.")
+            self._extra_seen_raw[raw_user_id].add(raw_game_id)
+            if self._user_mapper.contains_raw(raw_user_id):
+                u_idx = int(self._user_mapper.to_idx(raw_user_id))
+                i_idx = int(self._item_mapper.to_idx(raw_game_id))
+                self._extra_seen[u_idx].add(i_idx)
+                if rating == 1.0:
+                    self._user_positive_items.setdefault(u_idx, set()).add(i_idx)
+
+    def _get_combined_seen(self, user_idx: int) -> Set[int]:
+        seen = set(self._user_seen_items.get(user_idx, ()))
+        seen.update(self._extra_seen.get(user_idx, ()))
+        return seen
+
+    def recommend_games(
+        self,
+        raw_user_id: str,
+        top_k: int = 10,
+        exclude_played: bool = True,
+        genre_filter: Any = None,
+        max_price: Optional[float] = None,
+        *,
+        extra_seen: Any = (),
+    ) -> List[RecommendationResult]:
+        raw_user_id = validate_id(raw_user_id, "raw_user_id")
+        top_k = validate_top_k(top_k)
+        if not isinstance(exclude_played, bool):
+            raise InvalidParameterError("exclude_played must be boolean.")
+
+        if self._is_native:
+            combined_extra: Set[str] = self._normalize_extra_seen(extra_seen)
+            if raw_user_id in self._extra_seen_raw:
+                combined_extra.update(self._extra_seen_raw[raw_user_id])
+
+            return self._recommender.recommend_games(
+                raw_user_id,
+                top_k=top_k,
+                exclude_played=exclude_played,
+                genre_filter=genre_filter,
+                max_price=max_price,
+                extra_seen=tuple(combined_extra),
+            )
+
+        criteria = parse_filter_criteria(genre_filter, max_price)
+        is_fallback = False
+        mapped_user_idx: Optional[int] = None
+        requested_extra = self._normalize_extra_seen(extra_seen)
+
+        if self._user_mapper.contains_raw(raw_user_id):
+            mapped_user_idx = int(self._user_mapper.to_idx(raw_user_id))
+            user_pos = self._user_positive_items.get(mapped_user_idx, set())
+            if not user_pos:
+                if not self._allow_cold_start_fallback:
+                    raise ColdStartError(
+                        f"User '{raw_user_id}' has no positive train interactions "
+                        "and cold-start fallback is disabled."
+                    )
+                is_fallback = True
+        else:
+            if not self._allow_cold_start_fallback:
+                raise UnknownUserError(f"User '{raw_user_id}' is not in mapping.")
+            is_fallback = True
+
+        candidates = np.arange(self._item_mapper.size, dtype=np.int64)
+        if exclude_played:
+            seen_items = set()
+            if mapped_user_idx is not None:
+                seen_items.update(self._get_combined_seen(mapped_user_idx))
+            seen_items.update(self._item_indices_for_raw_ids(requested_extra))
+            seen_items.update(self._item_indices_for_raw_ids(self._extra_seen_raw.get(raw_user_id, ())))
+            if seen_items:
+                seen_arr = checked_indices(list(seen_items), self._item_mapper.size)
+                candidates = np.setdiff1d(candidates, seen_arr, assume_unique=True)
+
+        if candidates.size == 0:
+            return []
+
+        active_model_name = self.model_name
+        if is_fallback:
+            if self._fallback_model is None:
+                raise ConfigurationError("Cold-start fallback triggered but fallback_model is not configured.")
+            raw_scores = self._fallback_model.score_global(candidates)
+            scores = checked_scores(raw_scores, len(candidates))
+            active_model_name = getattr(self._fallback_model, "name", "Popularity")
+        else:
+            assert mapped_user_idx is not None
+            raw_scores = self._model.score_items(mapped_user_idx, candidates)
+            scores = checked_scores(raw_scores, len(candidates))
+
+        order = np.lexsort((candidates, -scores))
+
+        results: List[RecommendationResult] = []
+        for idx in order:
+            item_idx = int(candidates[idx])
+            raw_game_id = str(self._item_mapper.to_raw(item_idx))
+            game = self._try_get_catalog_game(raw_game_id)
+            if game is None:
+                continue
+            if not game_passes_filters(game, criteria):
+                continue
+            scored = ScoredItem(item_idx=item_idx, score=float(scores[idx]))
+            results.append(to_recommendation_result(
+                scored, game, len(results) + 1, active_model_name, is_fallback
+            ))
+            if len(results) == top_k:
+                break
+
+        return results
+
+    def get_user_played_games(self, raw_user_id: str) -> List[GameItem]:
+        raw_user_id = validate_id(raw_user_id, "raw_user_id")
+        if self._is_native:
+            if raw_user_id not in self._extra_seen_raw and hasattr(self._recommender, "_users") and raw_user_id not in self._recommender._users:
+                raise UnknownUserError(f"User '{raw_user_id}' is not in user mapper.")
+            games = []
+            if raw_user_id in getattr(self._recommender, "_users", {}):
+                games = list(self._recommender.get_user_played_games(raw_user_id))
+                if any(not isinstance(game, GameItem) for game in games):
+                    raise DataValidationError("get_user_played_games must return GameItem instances.")
+            if raw_user_id in self._extra_seen_raw:
+                seen_ids = {g.item_id for g in games}
+                for gid in sorted(self._extra_seen_raw[raw_user_id]):
+                    if gid not in seen_ids:
+                        try:
+                            games.append(self.get_game_details(gid))
+                            seen_ids.add(gid)
+                        except UnknownItemError:
+                            continue
+            return games
+
+        if not self._user_mapper.contains_raw(raw_user_id) and raw_user_id not in self._extra_seen_raw:
+            raise UnknownUserError(f"User '{raw_user_id}' is not in mapping.")
+        seen_indices = set()
+        if self._user_mapper.contains_raw(raw_user_id):
+            u_idx = int(self._user_mapper.to_idx(raw_user_id))
+            seen_indices.update(self._get_combined_seen(u_idx))
+        seen_indices.update(self._item_indices_for_raw_ids(self._extra_seen_raw.get(raw_user_id, ())))
+        games = []
+        for i_idx in sorted(seen_indices):
+            raw_id = str(self._item_mapper.to_raw(i_idx))
+            if raw_id not in self._catalog:
+                raise UnknownItemError(f"Game '{raw_id}' is not in catalog.")
+            games.append(self._catalog[raw_id])
+        return games
+
+    def get_game_details(self, raw_game_id: str) -> GameItem:
+        raw_game_id = validate_id(raw_game_id, "raw_game_id")
+        if self._is_native:
+            try:
+                game = self._recommender.get_game_details(raw_game_id)
+            except (KeyError, IndexError, UnknownItemError) as exc:
+                raise UnknownItemError(f"Game '{raw_game_id}' is not in the pretrained catalog.") from exc
+            if not isinstance(game, GameItem):
+                raise DataValidationError("catalog lookup must return a GameItem instance.")
+            return game
+        if raw_game_id not in self._catalog:
+            raise UnknownItemError(f"Game '{raw_game_id}' is not in catalog.")
+        game = self._catalog[raw_game_id]
+        if not isinstance(game, GameItem):
+            raise DataValidationError("catalog lookup must return a GameItem instance.")
+        return game
+
+    def get_catalog_metadata(self, raw_game_id: str) -> dict:
+        raw_game_id = validate_id(raw_game_id, "raw_game_id")
+        if self._is_native and hasattr(self._recommender, "get_catalog_metadata"):
+            return self._recommender.get_catalog_metadata(raw_game_id)
+        game = self.get_game_details(raw_game_id)
+        return {
+            "title": game.title,
+            "genres": list(game.genres),
+            "price": game.price,
+            "developer": game.developer,
+        }
+
+    def get_available_user_ids(self, limit: Optional[int] = None) -> tuple[str, ...]:
+        """Return raw user IDs available in the pretrained mapping."""
+        if self._is_native and hasattr(self._recommender, "_users"):
+            raw_ids = tuple(self._recommender._users.keys())
+        else:
+            raw_ids = tuple(self._user_mapper.to_raw(i) for i in range(self._user_mapper.size))
+        if limit is not None and limit > 0 and len(raw_ids) > limit:
+            step = max(1, len(raw_ids) // limit)
+            return raw_ids[::step][:limit]
+        return raw_ids
+
+    def get_available_game_ids(self) -> tuple[str, ...]:
+        """Return raw game IDs available in the pretrained catalog mapping."""
+        if self._is_native and hasattr(self._recommender, "_items"):
+            return tuple(self._recommender._items)
+        return tuple(str(self._item_mapper.to_raw(i)) for i in range(self._item_mapper.size))
+
+    def get_available_genres(self) -> tuple[str, ...]:
+        """Return sorted catalog genres for UI filters."""
+        genres: Set[str] = set()
+        for gid in self.get_available_game_ids():
+            game = self._try_get_catalog_game(gid)
+            if game is None:
+                continue
+            genres.update(str(g).strip() for g in game.genres if str(g).strip())
+        return tuple(sorted(genres, key=str.casefold))
+
+    def recommend_baseline(
+        self,
+        raw_user_id: Optional[str] = None,
+        top_k: int = 10,
+        exclude_played: bool = True,
+        genre_filter: Any = None,
+        max_price: Optional[float] = None,
+    ) -> List[RecommendationResult]:
+        """Generate baseline recommendations using popularity fallback."""
+        top_k = validate_top_k(top_k)
+        if not isinstance(exclude_played, bool):
+            raise InvalidParameterError("exclude_played must be boolean.")
+        criteria = parse_filter_criteria(genre_filter, max_price)
+        if raw_user_id is not None and not isinstance(raw_user_id, str):
+            raise InvalidParameterError("raw_user_id must be a non-empty string or None.")
+        if raw_user_id is not None:
+            raw_user_id = raw_user_id.strip() or None
+
+        if self._is_native:
+            item_ids = tuple(getattr(self._recommender, "_items", ()))
+            item_map = getattr(self._recommender, "_item_map", {})
+            candidates = np.arange(len(item_ids), dtype=np.int64)
+            excluded_raw = set(self._extra_seen_raw.get(raw_user_id, ())) if raw_user_id else set()
+            if raw_user_id and exclude_played and raw_user_id in getattr(self._recommender, "_users", {}):
+                user_idx = self._recommender._users[raw_user_id]
+                if hasattr(self._recommender, "_history"):
+                    excluded_raw.update(item_ids[int(i)] for i in self._recommender._history(user_idx))
+            if exclude_played and excluded_raw:
+                excluded = np.asarray(
+                    [int(item_map[g]) for g in excluded_raw if g in item_map], dtype=np.int64
+                )
+                candidates = np.setdiff1d(candidates, excluded, assume_unique=True)
+            scores = self._native_popularity_scores(candidates)
+            order = np.lexsort((candidates, -scores))
+            results: List[RecommendationResult] = []
+            model_name = getattr(self._fallback_model, "name", "Popularity")
+            for position in order:
+                item_idx = int(candidates[position])
+                raw_game_id = str(item_ids[item_idx])
+                game = self._try_get_catalog_game(raw_game_id)
+                if game is None:
+                    continue
+                if not game_passes_filters(game, criteria):
+                    continue
+                results.append(to_recommendation_result(
+                    ScoredItem(item_idx=item_idx, score=float(scores[position])),
+                    game,
+                    len(results) + 1,
+                    model_name,
+                    True,
+                ))
+                if len(results) == top_k:
+                    break
+            return results
+        else:
+            if self._fallback_model is None:
+                raise ConfigurationError("No fallback model configured for baseline.")
+            candidates = np.arange(self._item_mapper.size, dtype=np.int64)
+            if exclude_played:
+                excluded = set()
+                if raw_user_id and self._user_mapper.contains_raw(raw_user_id):
+                    excluded.update(self._get_combined_seen(int(self._user_mapper.to_idx(raw_user_id))))
+                if raw_user_id:
+                    excluded.update(self._item_indices_for_raw_ids(self._extra_seen_raw.get(raw_user_id, ())))
+                if excluded:
+                    candidates = np.setdiff1d(
+                        candidates,
+                        checked_indices(list(excluded), self._item_mapper.size),
+                        assume_unique=True,
+                    )
+            if candidates.size == 0:
+                return []
+            scores = checked_scores(self._fallback_model.score_global(candidates), len(candidates))
+            order = np.lexsort((candidates, -scores))
+            results = []
+            model_name = getattr(self._fallback_model, "name", "Popularity")
+            for position in order:
+                item_idx = int(candidates[position])
+                raw_game_id = str(self._item_mapper.to_raw(item_idx))
+                game = self._try_get_catalog_game(raw_game_id)
+                if game is None:
+                    continue
+                if not game_passes_filters(game, criteria):
+                    continue
+                results.append(to_recommendation_result(
+                    ScoredItem(item_idx=item_idx, score=float(scores[position])),
+                    game,
+                    len(results) + 1,
+                    model_name,
+                    True,
+                ))
+                if len(results) == top_k:
+                    break
+            return results
+
+    def _native_popularity_scores(self, candidates: np.ndarray) -> np.ndarray:
+        if self._fallback_model is None:
+            raise ConfigurationError("No popularity model configured for baseline.")
+        score_global = getattr(self._fallback_model, "score_global", None)
+        if callable(score_global):
+            return checked_scores(score_global(candidates), len(candidates))
+        counts = getattr(self._fallback_model, "counts", None)
+        if counts is not None:
+            return checked_scores(np.asarray(counts)[candidates], len(candidates))
+        raise ConfigurationError("Popularity fallback must provide score_global(item_ids) or counts.")
+
+    @staticmethod
+    def format_recommendations_table(results: Sequence[RecommendationResult]) -> str:
+        return format_recommendations_table(results)
+
+
+__all__ = [
+    "SimpleIdMapper",
+    "PretrainedDatasetProxy",
+    "PretrainedServiceFacade",
+]
