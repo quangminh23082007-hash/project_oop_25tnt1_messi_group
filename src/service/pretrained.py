@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from importlib import import_module
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set
 import numpy as np
@@ -33,7 +34,13 @@ from src.contracts.interfaces import (
 from src.service.filters import FilterCriteria, game_passes_filters, parse_filter_criteria
 from src.service.formatters import format_recommendations_table
 from src.service.mappers import to_recommendation_result
-from src.service.validators import validate_fallback_model, validate_id, validate_top_k
+from src.service.validators import (
+    model_matches_dataset,
+    validate_dataset,
+    validate_fallback_model,
+    validate_id,
+    validate_top_k,
+)
 
 
 class SimpleIdMapper:
@@ -55,7 +62,12 @@ class SimpleIdMapper:
 
 
 class PretrainedDatasetProxy:
-    """Read-only InteractionDataset proxy backed by pre-computed metadata bundles."""
+    """Read-only catalog/history wrapper for demos or explicit source data.
+
+    When ``interactions`` is omitted this object is metadata-only and has
+    ``split_name == 'metadata'``; it must not be passed to model training or
+    evaluation as an ``InteractionDataset``.
+    """
 
     def __init__(
         self,
@@ -70,14 +82,15 @@ class PretrainedDatasetProxy:
         interactions: Optional[Sequence[Interaction]] = None,
         provenance: Optional[dict] = None,
     ) -> None:
-        self.split_name = "train"
+        self.is_source_dataset = interactions is not None
+        self.split_name = "train" if self.is_source_dataset else "metadata"
         self.user_mapper = user_mapper
         self.item_mapper = item_mapper
         self.num_users = user_mapper.size
         self.num_items = item_mapper.size
-        self.mapping_fingerprint = mapping_fingerprint
-        self.fingerprint = fingerprint
-        self.review_fingerprint = review_fingerprint
+        self.mapping_fingerprint = mapping_fingerprint if self.is_source_dataset else None
+        self.fingerprint = fingerprint if self.is_source_dataset else None
+        self.review_fingerprint = review_fingerprint if self.is_source_dataset else None
 
         self._catalog = dict(catalog)
         self._user_seen = {u: frozenset(items) for u, items in user_seen_items.items()}
@@ -95,7 +108,6 @@ class PretrainedDatasetProxy:
         )
         self.num_interactions = len(self.interactions)
         self.provenance = dict(provenance or {})
-        self.is_source_dataset = bool(interactions is not None)
 
     def get_game_by_raw_id(self, raw_game_id: str) -> GameItem:
         if raw_game_id not in self._catalog:
@@ -147,20 +159,27 @@ class PretrainedServiceFacade:
         mapping_fingerprint: str = "mfp-pretrained",
         train_fingerprint: str = "fp-pretrained",
         catalog_lookup: Optional[Callable[[str], GameItem]] = None,
+        train_dataset: Optional[Any] = None,
     ) -> None:
         if isinstance(model, (str, Path)):
             facade = self.load(
                 model,
                 allow_cold_start_fallback=allow_cold_start_fallback,
                 catalog_lookup=catalog_lookup,
+                train_dataset=train_dataset,
             )
             self._is_native = True
             self._recommender = facade._recommender
             self._model = facade._recommender
             self._allow_cold_start_fallback = allow_cold_start_fallback
             self._extra_seen_raw: Dict[str, Set[str]] = defaultdict(set)
-            self._dataset_proxy: Optional[PretrainedDatasetProxy] = None
+            self._source_dataset: Optional[Any] = (
+                train_dataset
+                if train_dataset is not None
+                else self._source_dataset_from_recommender(self._recommender)
+            )
             self._fallback_model = getattr(self._recommender, "_popularity", None)
+            self._validate_source_dataset_if_present()
             return
 
         is_native = _is_pretrained_recommender(model) or (
@@ -175,8 +194,13 @@ class PretrainedServiceFacade:
             if hasattr(model, "allow_cold_start_fallback"):
                 model.allow_cold_start_fallback = allow_cold_start_fallback
             self._extra_seen_raw = defaultdict(set)
-            self._dataset_proxy = None
+            self._source_dataset = (
+                train_dataset
+                if train_dataset is not None
+                else self._source_dataset_from_recommender(model)
+            )
             self._fallback_model = getattr(model, "_popularity", None)
+            self._validate_source_dataset_if_present()
         else:
             if not isinstance(model, BaseRecommender):
                 raise InvalidParameterError("model must be an instance of BaseRecommender or PretrainedRecommender.")
@@ -192,9 +216,13 @@ class PretrainedServiceFacade:
             self._model = model
             self._fallback_model = fallback_model
             self._allow_cold_start_fallback = allow_cold_start_fallback
+            self._source_dataset = train_dataset
             self._user_mapper = user_mapper
             self._item_mapper = item_mapper
             self._catalog = dict(catalog)
+            self._mapping_fingerprint = mapping_fingerprint
+            self._train_fingerprint = train_fingerprint
+            self._validate_adapter_mappers()
             self._user_seen_items = {u: set(items) for u, items in user_seen_items.items()}
             self._user_positive_items = (
                 {u: set(items) for u, items in user_positive_items.items()}
@@ -203,21 +231,35 @@ class PretrainedServiceFacade:
             )
             self._extra_seen: Dict[int, Set[int]] = defaultdict(set)
             self._extra_seen_raw = defaultdict(set)
+            self._validate_adapter_histories()
 
-            self._dataset_proxy = PretrainedDatasetProxy(
-                user_mapper=user_mapper,
-                item_mapper=item_mapper,
-                catalog=self._catalog,
-                user_seen_items=self._user_seen_items,
-                user_positive_items=self._user_positive_items,
-                mapping_fingerprint=mapping_fingerprint,
-                fingerprint=train_fingerprint,
-            )
+            self._validate_source_dataset_if_present()
+            if self._source_dataset is not None and not model_matches_dataset(self._model, self._source_dataset):
+                raise DataValidationError(
+                    "model dimensions/fingerprints do not match the provided train_dataset."
+                )
+            if self._source_dataset is not None:
+                self._mapping_fingerprint = self._source_dataset.mapping_fingerprint
+                self._train_fingerprint = self._source_dataset.fingerprint
 
             if fallback_model is not None:
                 validate_fallback_model(fallback_model)
                 if not bool(getattr(fallback_model, "is_fitted", False)):
-                    fallback_model.fit(self._dataset_proxy)
+                    if self._source_dataset is None:
+                        raise ModelNotFittedError(
+                            "fallback_model must be fitted, or a real train_dataset must be supplied."
+                        )
+                    self._fit_fallback(fallback_model, self._source_dataset)
+                elif self._source_dataset is not None and not model_matches_dataset(
+                    fallback_model, self._source_dataset
+                ):
+                    raise DataValidationError(
+                        "fallback_model dimensions/fingerprints do not match the provided train_dataset."
+                    )
+            elif allow_cold_start_fallback:
+                raise ConfigurationError(
+                    "allow_cold_start_fallback=True requires a configured fallback_model in adapter mode."
+                )
 
     @classmethod
     def load(
@@ -226,6 +268,7 @@ class PretrainedServiceFacade:
         *,
         allow_cold_start_fallback: bool = False,
         catalog_lookup: Optional[Callable[[str], GameItem]] = None,
+        train_dataset: Optional[Any] = None,
     ) -> "PretrainedServiceFacade":
         """Load a trained model bundle and return a PretrainedServiceFacade."""
         for module_name in (
@@ -243,7 +286,11 @@ class PretrainedServiceFacade:
                         allow_cold_start_fallback=allow_cold_start_fallback,
                         catalog_lookup=catalog_lookup,
                     )
-                    return cls(recommender, allow_cold_start_fallback=allow_cold_start_fallback)
+                    return cls(
+                        recommender,
+                        allow_cold_start_fallback=allow_cold_start_fallback,
+                        train_dataset=train_dataset,
+                    )
             except (ImportError, AttributeError):
                 continue
         raise ConfigurationError(
@@ -257,12 +304,14 @@ class PretrainedServiceFacade:
         *,
         allow_cold_start_fallback: bool = False,
         catalog_lookup: Optional[Callable[[str], GameItem]] = None,
+        train_dataset: Optional[Any] = None,
     ) -> "PretrainedServiceFacade":
         """Alias for PretrainedServiceFacade.load."""
         return cls.load(
             folder,
             allow_cold_start_fallback=allow_cold_start_fallback,
             catalog_lookup=catalog_lookup,
+            train_dataset=train_dataset,
         )
 
     @property
@@ -291,6 +340,10 @@ class PretrainedServiceFacade:
     def allow_cold_start_fallback(self, value: bool) -> None:
         if not isinstance(value, bool):
             raise InvalidParameterError("allow_cold_start_fallback must be boolean.")
+        if value and not self._is_native and self._fallback_model is None:
+            raise ConfigurationError(
+                "allow_cold_start_fallback=True requires a configured fallback_model in adapter mode."
+            )
         self._allow_cold_start_fallback = value
         if self._is_native and hasattr(self._recommender, "allow_cold_start_fallback"):
             self._recommender.allow_cold_start_fallback = value
@@ -301,22 +354,80 @@ class PretrainedServiceFacade:
             return getattr(self._recommender, "provenance", {})
         return {
             "protocol": "service-adapter-v1",
-            "mapping_fingerprint": self.dataset.mapping_fingerprint,
-            "train_fingerprint": self.dataset.fingerprint,
+            "mapping_fingerprint": getattr(self, "_mapping_fingerprint", None),
+            "train_fingerprint": getattr(self, "_train_fingerprint", None),
         }
 
     @property
-    def dataset(self) -> PretrainedDatasetProxy:
-        if self._dataset_proxy is not None:
-            return self._dataset_proxy
+    def metadata(self) -> dict:
+        """Return bundle/adapter metadata without presenting it as a dataset."""
         if self._is_native:
-            source_dataset = self._source_dataset_from_recommender(self._recommender)
-            if source_dataset is not None:
-                self._dataset_proxy = source_dataset
-                return source_dataset
-            self._dataset_proxy = self._build_dataset_proxy_from_recommender(self._recommender)
-            return self._dataset_proxy
-        raise ConfigurationError("Dataset proxy is not initialized.")
+            return dict(getattr(self._recommender, "provenance", {}) or {})
+        return self.provenance
+
+    @property
+    def dataset(self) -> Any:
+        """Return the real train dataset, never a synthetic metadata proxy."""
+        if self._source_dataset is None:
+            raise ConfigurationError(
+                "This pretrained facade has metadata only; provide the original train_dataset "
+                "for training or evaluation."
+            )
+        return self._source_dataset
+
+    def _validate_source_dataset_if_present(self) -> None:
+        if self._source_dataset is None:
+            return
+        source_dataset = self._source_dataset
+        if hasattr(source_dataset, "train") and hasattr(source_dataset, "validation") and hasattr(source_dataset, "test"):
+            source_dataset = source_dataset.train
+            self._source_dataset = source_dataset
+        validate_dataset(source_dataset, "train")
+        if source_dataset.split_name != "train":
+            raise DataValidationError("train_dataset must have split_name='train'.")
+        if source_dataset.num_interactions == 0:
+            raise EmptyDatasetError("train_dataset contains zero interactions.")
+
+    @staticmethod
+    def _fit_fallback(fallback_model: BaseRecommender, train_dataset: Any) -> None:
+        try:
+            fallback_model.fit(train_dataset)
+        except RecSysError:
+            raise
+        except Exception as exc:
+            raise ConfigurationError(f"Fallback model training failed: {exc}") from exc
+        if not model_matches_dataset(fallback_model, train_dataset):
+            raise DataValidationError(
+                "fallback_model did not finish fitted with the train dimensions/fingerprints."
+            )
+
+    def _validate_adapter_mappers(self) -> None:
+        for name, mapper in (("user_mapper", self._user_mapper), ("item_mapper", self._item_mapper)):
+            size = getattr(mapper, "size", None)
+            if (
+                isinstance(size, bool)
+                or not isinstance(size, Integral)
+                or size < 0
+                or not callable(getattr(mapper, "contains_raw", None))
+                or not callable(getattr(mapper, "to_idx", None))
+                or not callable(getattr(mapper, "to_raw", None))
+            ):
+                raise DataValidationError(f"{name} does not satisfy IdMapper.")
+
+    def _validate_adapter_histories(self) -> None:
+        for mapping_name, histories, limit in (
+            ("user_seen_items", self._user_seen_items, self._item_mapper.size),
+            ("user_positive_items", self._user_positive_items, self._item_mapper.size),
+        ):
+            for user_idx, item_ids in histories.items():
+                if (
+                    isinstance(user_idx, bool)
+                    or not isinstance(user_idx, Integral)
+                    or user_idx < 0
+                    or user_idx >= self._user_mapper.size
+                ):
+                    raise DataValidationError(f"{mapping_name} contains an invalid user index.")
+                checked_indices(list(item_ids), limit)
 
     @classmethod
     def _source_dataset_from_recommender(cls, recommender: Any) -> Optional[Any]:
@@ -342,9 +453,11 @@ class PretrainedServiceFacade:
         catalog: Dict[str, GameItem] = {}
         for gid in item_ids:
             try:
-                catalog[gid] = recommender.get_game_details(gid)
-            except Exception:
-                catalog[gid] = GameItem(item_id=gid, title=gid)
+                game = recommender.get_game_details(gid)
+            except (KeyError, IndexError, UnknownItemError):
+                continue
+            if isinstance(game, GameItem):
+                catalog[gid] = game
 
         provenance = getattr(recommender, "provenance", {}) or {}
         mapping_fp = provenance.get("mapping_fingerprint") or provenance.get("mapping_fp")
@@ -391,6 +504,15 @@ class PretrainedServiceFacade:
             if self._item_mapper.contains_raw(raw_id)
         }
 
+    def _try_get_catalog_game(self, raw_game_id: str) -> Optional[GameItem]:
+        try:
+            game = self.get_game_details(raw_game_id)
+        except (KeyError, IndexError, UnknownItemError):
+            return None
+        if not isinstance(game, GameItem):
+            raise DataValidationError("catalog lookup must return a GameItem instance.")
+        return game
+
     def record_user_interaction(
         self,
         raw_user_id: str,
@@ -400,6 +522,8 @@ class PretrainedServiceFacade:
         """Record dynamic runtime interaction (extra_seen) from session/UI."""
         raw_user_id = validate_id(raw_user_id, "raw_user_id")
         raw_game_id = validate_id(raw_game_id, "raw_game_id")
+        if isinstance(rating, bool) or not isinstance(rating, Real) or float(rating) not in (0.0, 1.0):
+            raise InvalidParameterError("rating must be exactly 0.0 or 1.0.")
 
         if self._is_native:
             if hasattr(self._recommender, "_items") and raw_game_id not in getattr(self._recommender, "_item_map", set(self._recommender._items)):
@@ -504,9 +628,9 @@ class PretrainedServiceFacade:
         for idx in order:
             item_idx = int(candidates[idx])
             raw_game_id = str(self._item_mapper.to_raw(item_idx))
-            if raw_game_id not in self._catalog:
+            game = self._try_get_catalog_game(raw_game_id)
+            if game is None:
                 continue
-            game = self._catalog[raw_game_id]
             if not game_passes_filters(game, criteria):
                 continue
             scored = ScoredItem(item_idx=item_idx, score=float(scores[idx]))
@@ -526,6 +650,8 @@ class PretrainedServiceFacade:
             games = []
             if raw_user_id in getattr(self._recommender, "_users", {}):
                 games = list(self._recommender.get_user_played_games(raw_user_id))
+                if any(not isinstance(game, GameItem) for game in games):
+                    raise DataValidationError("get_user_played_games must return GameItem instances.")
             if raw_user_id in self._extra_seen_raw:
                 seen_ids = {g.item_id for g in games}
                 for gid in sorted(self._extra_seen_raw[raw_user_id]):
@@ -555,10 +681,19 @@ class PretrainedServiceFacade:
     def get_game_details(self, raw_game_id: str) -> GameItem:
         raw_game_id = validate_id(raw_game_id, "raw_game_id")
         if self._is_native:
-            return self._recommender.get_game_details(raw_game_id)
+            try:
+                game = self._recommender.get_game_details(raw_game_id)
+            except (KeyError, IndexError, UnknownItemError) as exc:
+                raise UnknownItemError(f"Game '{raw_game_id}' is not in the pretrained catalog.") from exc
+            if not isinstance(game, GameItem):
+                raise DataValidationError("catalog lookup must return a GameItem instance.")
+            return game
         if raw_game_id not in self._catalog:
             raise UnknownItemError(f"Game '{raw_game_id}' is not in catalog.")
-        return self._catalog[raw_game_id]
+        game = self._catalog[raw_game_id]
+        if not isinstance(game, GameItem):
+            raise DataValidationError("catalog lookup must return a GameItem instance.")
+        return game
 
     def get_catalog_metadata(self, raw_game_id: str) -> dict:
         raw_game_id = validate_id(raw_game_id, "raw_game_id")
@@ -577,7 +712,7 @@ class PretrainedServiceFacade:
         if self._is_native and hasattr(self._recommender, "_users"):
             raw_ids = tuple(self._recommender._users.keys())
         else:
-            raw_ids = tuple(self.dataset.user_mapper.to_raw(i) for i in range(self.dataset.num_users))
+            raw_ids = tuple(self._user_mapper.to_raw(i) for i in range(self._user_mapper.size))
         if limit is not None and limit > 0 and len(raw_ids) > limit:
             step = max(1, len(raw_ids) // limit)
             return raw_ids[::step][:limit]
@@ -587,18 +722,16 @@ class PretrainedServiceFacade:
         """Return raw game IDs available in the pretrained catalog mapping."""
         if self._is_native and hasattr(self._recommender, "_items"):
             return tuple(self._recommender._items)
-        mapper = self.dataset.item_mapper
-        return tuple(str(mapper.to_raw(i)) for i in range(mapper.size))
+        return tuple(str(self._item_mapper.to_raw(i)) for i in range(self._item_mapper.size))
 
     def get_available_genres(self) -> tuple[str, ...]:
         """Return sorted catalog genres for UI filters."""
         genres: Set[str] = set()
         for gid in self.get_available_game_ids():
-            try:
-                game = self.get_game_details(gid)
-                genres.update(str(g).strip() for g in game.genres if str(g).strip())
-            except Exception:
+            game = self._try_get_catalog_game(gid)
+            if game is None:
                 continue
+            genres.update(str(g).strip() for g in game.genres if str(g).strip())
         return tuple(sorted(genres, key=str.casefold))
 
     def recommend_baseline(
@@ -614,6 +747,10 @@ class PretrainedServiceFacade:
         if not isinstance(exclude_played, bool):
             raise InvalidParameterError("exclude_played must be boolean.")
         criteria = parse_filter_criteria(genre_filter, max_price)
+        if raw_user_id is not None and not isinstance(raw_user_id, str):
+            raise InvalidParameterError("raw_user_id must be a non-empty string or None.")
+        if raw_user_id is not None:
+            raw_user_id = raw_user_id.strip() or None
 
         if self._is_native:
             item_ids = tuple(getattr(self._recommender, "_items", ()))
@@ -636,9 +773,8 @@ class PretrainedServiceFacade:
             for position in order:
                 item_idx = int(candidates[position])
                 raw_game_id = str(item_ids[item_idx])
-                try:
-                    game = self.get_game_details(raw_game_id)
-                except UnknownItemError:
+                game = self._try_get_catalog_game(raw_game_id)
+                if game is None:
                     continue
                 if not game_passes_filters(game, criteria):
                     continue
@@ -677,7 +813,9 @@ class PretrainedServiceFacade:
             for position in order:
                 item_idx = int(candidates[position])
                 raw_game_id = str(self._item_mapper.to_raw(item_idx))
-                game = self.get_game_details(raw_game_id)
+                game = self._try_get_catalog_game(raw_game_id)
+                if game is None:
+                    continue
                 if not game_passes_filters(game, criteria):
                     continue
                 results.append(to_recommendation_result(

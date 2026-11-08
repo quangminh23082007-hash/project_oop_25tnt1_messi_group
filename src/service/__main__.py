@@ -7,7 +7,7 @@ Usage:
 from typing import Dict, Set
 import numpy as np
 
-from src.contracts.dto import GameItem
+from src.contracts.dto import GameItem, Interaction
 from src.contracts.interfaces import BaseRecommender
 from src.service.pretrained import PretrainedDatasetProxy, PretrainedServiceFacade, SimpleIdMapper
 from src.service.recommendation_service import RecommendationService
@@ -71,6 +71,11 @@ def _create_fallback_demo_service() -> RecommendationService:
     }
     user_seen = {0: {0, 1}, 1: {1, 2}, 2: {3}, 3: {0, 2, 3}, 4: {0}}
     user_pos = {0: {0}, 1: {1, 2}, 2: {3}, 3: {2, 3}, 4: set()}
+    interactions = tuple(
+        Interaction(user_id=user_idx, item_id=item_idx, rating=1.0 if item_idx in user_pos.get(user_idx, set()) else 0.0)
+        for user_idx, item_ids in user_seen.items()
+        for item_idx in item_ids
+    )
 
     dataset = PretrainedDatasetProxy(
         user_mapper=SimpleIdMapper(raw_user_ids),
@@ -80,6 +85,7 @@ def _create_fallback_demo_service() -> RecommendationService:
         user_positive_items=user_pos,
         mapping_fingerprint="demo-mfp",
         fingerprint="demo-train-fp",
+        interactions=interactions,
     )
 
     model = DemoRecommender()

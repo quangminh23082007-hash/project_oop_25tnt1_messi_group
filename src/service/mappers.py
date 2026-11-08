@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from math import isfinite
+from numbers import Integral, Real
+
 from src.contracts.dto import GameItem, RecommendationResult, ScoredItem
+from src.contracts.exceptions import DataValidationError
 
 
 def to_recommendation_result(
@@ -12,6 +16,14 @@ def to_recommendation_result(
     model_name: str,
     is_fallback: bool,
 ) -> RecommendationResult:
+    if not isinstance(scored, ScoredItem):
+        raise DataValidationError("scored must be a ScoredItem instance.")
+    if not isinstance(game, GameItem):
+        raise DataValidationError("game must be a GameItem instance.")
+    if isinstance(rank, bool) or not isinstance(rank, Integral) or rank <= 0:
+        raise DataValidationError("recommendation rank must be a positive integer.")
+    if isinstance(scored.score, bool) or not isinstance(scored.score, Real) or not isfinite(scored.score):
+        raise DataValidationError("recommendation score must be finite.")
     raw_genres = getattr(game, "genres", ()) or ()
     if isinstance(raw_genres, str):
         raw_genres = (raw_genres,)

@@ -33,7 +33,7 @@ class StubDataset:
         user_ids: Optional[List[str]] = None,
         item_ids: Optional[List[str]] = None,
         mapping_fingerprint: str = "mfp-test-01",
-        fingerprint: str = "fp-test-01",
+        fingerprint: Optional[str] = None,
         review_fingerprint: str = "rfp-test-01",
     ):
         self.split_name = split_name
@@ -42,15 +42,18 @@ class StubDataset:
         self.user_mapper = StubIdMapper(user_ids or [f"u{i}" for i in range(num_users)])
         self.item_mapper = StubIdMapper(item_ids or [f"g{i}" for i in range(num_items)])
         self.mapping_fingerprint = mapping_fingerprint
-        self.fingerprint = fingerprint
+        self.fingerprint = fingerprint or f"fp-test-01-{split_name}"
         self.review_fingerprint = review_fingerprint
 
         if interactions is None:
+            split_interactions = {
+                "train": ((0, 0, 1.0), (0, 1, 0.0), (1, 2, 1.0), (2, 3, 0.0)),
+                "validation": ((0, 2, 0.0), (1, 3, 1.0), (2, 4, 0.0)),
+                "test": ((0, 3, 1.0), (1, 4, 0.0), (2, 0, 1.0)),
+            }
             self.interactions = [
-                Interaction(user_id=0, item_id=0, rating=1.0, timestamp=100),
-                Interaction(user_id=0, item_id=1, rating=0.0, timestamp=101),
-                Interaction(user_id=1, item_id=2, rating=1.0, timestamp=102),
-                Interaction(user_id=2, item_id=3, rating=0.0, timestamp=103),
+                Interaction(user_id=user_id, item_id=item_id, rating=rating, timestamp=100 + offset)
+                for offset, (user_id, item_id, rating) in enumerate(split_interactions[split_name])
             ]
         else:
             self.interactions = interactions

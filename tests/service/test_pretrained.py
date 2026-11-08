@@ -8,6 +8,7 @@ from src.contracts.exceptions import (
     ColdStartError,
     ConfigurationError,
     InvalidParameterError,
+    ModelNotFittedError,
     UnknownItemError,
     UnknownUserError,
 )
@@ -162,6 +163,7 @@ class TestPretrained(unittest.TestCase):
             user_positive_items=user_pos,
             fallback_model=self.fallback_model,
             allow_cold_start_fallback=True,
+            train_dataset=self.data,
         )
 
         results = facade.recommend_games("u0", top_k=1)
@@ -216,6 +218,53 @@ class TestPretrained(unittest.TestCase):
         results = facade.recommend_games("new-user", top_k=1)
         self.assertEqual(results[0].game_id, "g1")
         self.assertTrue(results[0].is_fallback)
+
+    def test_adapter_fits_unfitted_fallback_only_on_real_train_dataset(self):
+        self.model.fit(self.data)
+        facade = PretrainedServiceFacade(
+            model=self.model,
+            user_mapper=self.data.user_mapper,
+            item_mapper=self.data.item_mapper,
+            catalog=self.data._games,
+            user_seen_items={0: {0, 1}, 1: {2}, 2: {3}},
+            user_positive_items={0: {0}, 1: {2}, 2: set()},
+            fallback_model=StubPopularityRecommender(),
+            allow_cold_start_fallback=True,
+            train_dataset=self.data,
+        )
+        self.assertTrue(facade.fallback_model.is_fitted)
+        self.assertEqual(facade.recommend_baseline(top_k=1)[0].game_id, "g0")
+
+    def test_adapter_rejects_unfitted_fallback_without_train_dataset(self):
+        self.model.fit(self.data)
+        with self.assertRaises(ModelNotFittedError):
+            PretrainedServiceFacade(
+                model=self.model,
+                user_mapper=self.data.user_mapper,
+                item_mapper=self.data.item_mapper,
+                catalog=self.data._games,
+                user_seen_items={0: {0, 1}, 1: {2}, 2: {3}},
+                fallback_model=StubPopularityRecommender(),
+                allow_cold_start_fallback=True,
+            )
+
+    def test_adapter_baseline_skips_missing_catalog_metadata(self):
+        self.model.fit(self.data)
+        fallback = StubPopularityRecommender()
+        fallback.fit(self.data)
+        catalog = dict(self.data._games)
+        del catalog["g0"]
+        facade = PretrainedServiceFacade(
+            model=self.model,
+            user_mapper=self.data.user_mapper,
+            item_mapper=self.data.item_mapper,
+            catalog=catalog,
+            user_seen_items={0: set(), 1: set(), 2: set()},
+            fallback_model=fallback,
+            allow_cold_start_fallback=True,
+        )
+        results = facade.recommend_baseline(top_k=1, exclude_played=False)
+        self.assertEqual(results[0].game_id, "g1")
 
     def test_pretrained_service_facade_cold_start_and_unknown_user(self):
         self.model.fit(self.data)
@@ -305,14 +354,16 @@ class TestPretrained(unittest.TestCase):
         self.assertEqual(baseline[0].game_id, "g3")
         self.assertTrue(baseline[0].is_fallback)
 
-        # Dataset proxy generation
-        ds_proxy = facade.dataset
-        self.assertIsInstance(ds_proxy, PretrainedDatasetProxy)
-        self.assertEqual(ds_proxy.num_users, 3)
-        self.assertEqual(ds_proxy.num_items, 4)
-        self.assertEqual(ds_proxy.user_mapper.to_raw(0), "u0")
-        self.assertEqual(ds_proxy.interactions, ())
-        self.assertEqual(ds_proxy.review_fingerprint, "rfp-unavailable")
+        # A bundle without its source train dataset exposes metadata only.
+        with self.assertRaises(ConfigurationError):
+            _ = facade.dataset
+        self.assertEqual(facade.metadata["data_fingerprint"], "original-training")
+
+    def test_native_uses_explicit_source_train_dataset(self):
+        recommender = StubRealPretrainedRecommender()
+        recommender.train_dataset = self.data
+        facade = PretrainedServiceFacade(recommender)
+        self.assertIs(facade.dataset, self.data)
 
     def test_native_records_interaction_for_new_session_user(self):
         recommender = StubRealPretrainedRecommender(allow_cold_start_fallback=True)

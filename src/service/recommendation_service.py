@@ -168,9 +168,24 @@ class RecommendationService:
             if not model_matches_dataset(model, dataset):
                 raise TrainingError(f"{role} did not finish fitted with the train dimensions/fingerprints.")
         except RecSysError:
+            cls._invalidate_model(model)
             raise
         except Exception as exc:
+            cls._invalidate_model(model)
             raise TrainingError(f"{role} training failed: {exc}") from exc
+
+    @staticmethod
+    def _invalidate_model(model: BaseRecommender) -> None:
+        """Ensure a failed fit cannot leave a model looking usable."""
+        for attr, value in (
+            ("_is_fitted", False),
+            ("_num_users", 0),
+            ("_num_items", 0),
+            ("_mapping_fingerprint", None),
+            ("_train_fingerprint", None),
+        ):
+            if hasattr(model, attr):
+                setattr(model, attr, value)
 
     def _user_idx(self, raw_user_id: str) -> int:
         mapper = self._train_dataset.user_mapper
@@ -192,6 +207,15 @@ class RecommendationService:
 
     def _positive_items(self, user_idx: int) -> frozenset[int]:
         return frozenset(self._train_dataset.get_user_positive_items(user_idx))
+
+    def _try_get_catalog_game(self, raw_game_id: str) -> Optional[GameItem]:
+        try:
+            game = self._train_dataset.get_game_by_raw_id(raw_game_id)
+        except (KeyError, IndexError, UnknownItemError):
+            return None
+        if not isinstance(game, GameItem):
+            raise DataValidationError("get_game_by_raw_id must return a GameItem instance.")
+        return game
 
     def _new_popularity_model(self) -> BaseRecommender:
         for module_name in (
@@ -249,6 +273,12 @@ class RecommendationService:
         item_features: Any = None,
         verbose: bool = False,
     ) -> "RecommendationService":
+        # Any new training attempt invalidates the previous service snapshot.
+        # This prevents a failed retrain from leaving the old model/dataset
+        # pair looking ready after the caller explicitly requested a change.
+        self._train_dataset = None
+        self._fallback_dataset = None
+
         if train_dataset is None:
             raise EmptyDatasetError("Cannot train on None dataset.")
         if hasattr(train_dataset, "train") and hasattr(train_dataset, "validation") and hasattr(train_dataset, "test"):
@@ -265,10 +295,6 @@ class RecommendationService:
             raise InvalidParameterError("validation_score must be callable or None.")
         if not isinstance(verbose, bool):
             raise InvalidParameterError("verbose must be a boolean.")
-
-        # Reset state so failure leaves the service unready
-        self._train_dataset = None
-        self._fallback_dataset = None
 
         fit_kwargs: dict = {}
         if validation_score is not None:
@@ -380,12 +406,9 @@ class RecommendationService:
         results: List[RecommendationResult] = []
         for scored in scored_items:
             raw_game_id = self._raw_item_id(scored.item_idx)
-            try:
-                game: GameItem = self._train_dataset.get_game_by_raw_id(raw_game_id)
-            except (KeyError, IndexError, UnknownItemError):
+            game = self._try_get_catalog_game(raw_game_id)
+            if game is None:
                 continue
-            if not isinstance(game, GameItem):
-                raise DataValidationError("get_game_by_raw_id must return a GameItem instance.")
             if not game_passes_filters(game, criteria):
                 continue
 
@@ -417,12 +440,9 @@ class RecommendationService:
                 raw_game_id = self._raw_item_id(scored.item_idx)
                 if raw_game_id in seen_result_ids:
                     continue
-                try:
-                    game = self._train_dataset.get_game_by_raw_id(raw_game_id)
-                except (KeyError, IndexError, UnknownItemError):
+                game = self._try_get_catalog_game(raw_game_id)
+                if game is None:
                     continue
-                if not isinstance(game, GameItem):
-                    raise DataValidationError("get_game_by_raw_id must return a GameItem instance.")
                 if not game_passes_filters(game, criteria):
                     continue
                 results.append(to_recommendation_result(
@@ -481,9 +501,8 @@ class RecommendationService:
         self._ensure_ready()
         genres: set[str] = set()
         for raw_game_id in self.get_available_game_ids():
-            try:
-                game = self._train_dataset.get_game_by_raw_id(raw_game_id)
-            except (KeyError, IndexError, UnknownItemError):
+            game = self._try_get_catalog_game(raw_game_id)
+            if game is None:
                 continue
             genres.update(str(genre).strip() for genre in game.genres if str(genre).strip())
         return tuple(sorted(genres, key=str.casefold))
@@ -497,26 +516,29 @@ class RecommendationService:
         max_price: Optional[float] = None,
     ) -> List[RecommendationResult]:
         """Generate baseline recommendations from the popularity fallback model."""
+        top_k = validate_top_k(top_k)
+        if not isinstance(exclude_played, bool):
+            raise InvalidParameterError("exclude_played must be a boolean.")
+        criteria = parse_filter_criteria(genre_filter, max_price)
         self._ensure_ready()
         self._ensure_fallback_ready()
         mapped_user_idx: Optional[int] = None
-        if raw_user_id is not None and str(raw_user_id).strip():
+        if raw_user_id is not None and not isinstance(raw_user_id, str):
+            raise InvalidParameterError("raw_user_id must be a non-empty string or None.")
+        if raw_user_id is not None and raw_user_id.strip():
             try:
-                mapped_user_idx = self._user_idx(validate_id(str(raw_user_id).strip(), "raw_user_id"))
+                mapped_user_idx = self._user_idx(validate_id(raw_user_id, "raw_user_id"))
             except (UnknownUserError, InvalidParameterError):
                 mapped_user_idx = None
         scored_items = self._fallback_scores(
             exclude_seen_for_user=mapped_user_idx if exclude_played else None
         )
-        criteria = parse_filter_criteria(genre_filter, max_price)
-        top_k = validate_top_k(top_k)
         results: List[RecommendationResult] = []
         model_name = getattr(self._fallback_model, "name", "Popularity baseline")
         for scored in scored_items:
             raw_game_id = self._train_dataset.item_mapper.to_raw(scored.item_idx)
-            try:
-                game = self._train_dataset.get_game_by_raw_id(raw_game_id)
-            except (KeyError, IndexError, UnknownItemError):
+            game = self._try_get_catalog_game(raw_game_id)
+            if game is None:
                 continue
             if not game_passes_filters(game, criteria):
                 continue
@@ -572,6 +594,7 @@ class RecommendationService:
         *,
         allow_cold_start_fallback: bool = False,
         catalog_lookup: Any = None,
+        train_dataset: Any = None,
     ) -> Any:
         """Load a trained model bundle and return a PretrainedServiceFacade (Contracts v1.1 Section 6)."""
         from src.service.pretrained import PretrainedServiceFacade
@@ -579,6 +602,7 @@ class RecommendationService:
             folder,
             allow_cold_start_fallback=allow_cold_start_fallback,
             catalog_lookup=catalog_lookup,
+            train_dataset=train_dataset,
         )
 
 

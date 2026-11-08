@@ -3,6 +3,7 @@ from __future__ import annotations
 from numbers import Integral
 from typing import Any
 
+from src.contracts.dto import Interaction
 from src.contracts.exceptions import (
     ConfigurationError,
     DataValidationError,
@@ -67,6 +68,17 @@ def validate_dataset(dataset: Any, role: str) -> None:
         raise DataValidationError(
             f"{role}.num_interactions must match the interactions sequence length."
         )
+
+    seen_pairs = set()
+    for interaction in dataset.interactions:
+        if not isinstance(interaction, Interaction):
+            raise DataValidationError(f"{role}.interactions must contain Interaction instances.")
+        if interaction.user_id >= dataset.num_users or interaction.item_id >= dataset.num_items:
+            raise DataValidationError(f"{role}.interactions contains an index outside the declared dimensions.")
+        pair = (int(interaction.user_id), int(interaction.item_id))
+        if pair in seen_pairs:
+            raise DataValidationError(f"{role}.interactions contains duplicate user-item pairs.")
+        seen_pairs.add(pair)
 
     for mapper_name in ("user_mapper", "item_mapper"):
         mapper = getattr(dataset, mapper_name)
@@ -135,6 +147,11 @@ def validate_evaluation_dataset(
     train_dataset: Any,
     additional_seen_dataset: Any = None,
 ) -> None:
+    validate_dataset(train_dataset, "train")
+    if train_dataset.split_name != "train":
+        raise DataValidationError("train_dataset must have split_name 'train'.")
+    if train_dataset.num_interactions == 0:
+        raise EmptyDatasetError("train_dataset contains zero interactions.")
     validate_dataset(evaluation_dataset, "evaluation")
     if evaluation_dataset.split_name not in {"validation", "test"}:
         raise DataValidationError(
@@ -153,6 +170,11 @@ def validate_evaluation_dataset(
         )
     if evaluation_dataset.num_interactions == 0:
         raise EmptyDatasetError("evaluation_dataset contains zero interactions.")
+
+    train_pairs = {(int(row.user_id), int(row.item_id)) for row in train_dataset.interactions}
+    evaluation_pairs = {(int(row.user_id), int(row.item_id)) for row in evaluation_dataset.interactions}
+    if train_pairs.intersection(evaluation_pairs):
+        raise DataValidationError("train and evaluation datasets contain duplicate user-item pairs.")
 
     if additional_seen_dataset is not None:
         if evaluation_dataset.split_name != "test":
@@ -174,4 +196,13 @@ def validate_evaluation_dataset(
         ):
             raise DataValidationError(
                 "additional_seen_dataset dimensions do not match the train dataset."
+            )
+        additional_pairs = {
+            (int(row.user_id), int(row.item_id)) for row in additional_seen_dataset.interactions
+        }
+        if train_pairs.intersection(additional_pairs):
+            raise DataValidationError("train and additional_seen datasets contain duplicate user-item pairs.")
+        if evaluation_pairs.intersection(additional_pairs):
+            raise DataValidationError(
+                "evaluation and additional_seen datasets contain duplicate user-item pairs."
             )

@@ -1,6 +1,6 @@
 import unittest
 
-from src.contracts.dto import EvaluationResult
+from src.contracts.dto import EvaluationResult, Interaction
 from src.contracts.exceptions import (
     DataValidationError,
     EmptyDatasetError,
@@ -75,6 +75,15 @@ class TestEvaluation(unittest.TestCase):
         invalid_seen_data = StubDataset(split_name="test")
         with self.assertRaises(DataValidationError):
             svc.evaluate_model(test_data, additional_seen_dataset=invalid_seen_data)
+
+    def test_evaluate_model_rejects_user_item_overlap_between_splits(self):
+        svc = RecommendationService(self.model, evaluator=self.evaluator).train(self.data)
+        overlapping_validation = StubDataset(
+            split_name="validation",
+            interactions=[Interaction(user_id=0, item_id=0, rating=1.0, timestamp=200)],
+        )
+        with self.assertRaises(DataValidationError):
+            svc.evaluate_model(overlapping_validation)
 
 
 if __name__ == "__main__":
