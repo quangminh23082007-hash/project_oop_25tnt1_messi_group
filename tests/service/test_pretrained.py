@@ -136,6 +136,12 @@ class StubRealPretrainedRecommender:
         return results
 
 
+class PrimaryPrefersLastItemModel(StubModel):
+    def score_items(self, user_id: int, item_ids: Any) -> np.ndarray:
+        ids = np.asarray(item_ids, dtype=np.int64)
+        return ids.astype(float)
+
+
 class TestPretrained(unittest.TestCase):
     def setUp(self):
         self.data = StubDataset()
@@ -170,6 +176,46 @@ class TestPretrained(unittest.TestCase):
         new_results = facade.recommend_games("u0", top_k=1)
         self.assertEqual(len(new_results), 1)
         self.assertEqual(new_results[0].game_id, "g3")
+
+    def test_adapter_baseline_always_uses_global_fallback_scores(self):
+        primary = PrimaryPrefersLastItemModel()
+        primary.fit(self.data)
+        fallback = StubPopularityRecommender()
+        fallback.fit(self.data)
+        facade = PretrainedServiceFacade(
+            model=primary,
+            user_mapper=self.data.user_mapper,
+            item_mapper=self.data.item_mapper,
+            catalog=self.data._games,
+            user_seen_items={0: {0, 1}, 1: {2}, 2: {3}},
+            user_positive_items={0: {0}, 1: {2}, 2: set()},
+            fallback_model=fallback,
+            allow_cold_start_fallback=True,
+        )
+
+        baseline = facade.recommend_baseline("u0", top_k=1)
+        self.assertEqual(baseline[0].game_id, "g2")
+        self.assertTrue(baseline[0].is_fallback)
+
+    def test_adapter_records_interaction_for_new_session_user(self):
+        self.model.fit(self.data)
+        self.fallback_model.fit(self.data)
+        facade = PretrainedServiceFacade(
+            model=self.model,
+            user_mapper=self.data.user_mapper,
+            item_mapper=self.data.item_mapper,
+            catalog=self.data._games,
+            user_seen_items={0: {0, 1}, 1: {2}, 2: {3}},
+            user_positive_items={0: {0}, 1: {2}, 2: set()},
+            fallback_model=self.fallback_model,
+            allow_cold_start_fallback=True,
+        )
+
+        facade.record_user_interaction("new-user", "g0")
+        self.assertEqual([g.item_id for g in facade.get_user_played_games("new-user")], ["g0"])
+        results = facade.recommend_games("new-user", top_k=1)
+        self.assertEqual(results[0].game_id, "g1")
+        self.assertTrue(results[0].is_fallback)
 
     def test_pretrained_service_facade_cold_start_and_unknown_user(self):
         self.model.fit(self.data)
@@ -265,6 +311,17 @@ class TestPretrained(unittest.TestCase):
         self.assertEqual(ds_proxy.num_users, 3)
         self.assertEqual(ds_proxy.num_items, 4)
         self.assertEqual(ds_proxy.user_mapper.to_raw(0), "u0")
+        self.assertEqual(ds_proxy.interactions, ())
+        self.assertEqual(ds_proxy.review_fingerprint, "rfp-unavailable")
+
+    def test_native_records_interaction_for_new_session_user(self):
+        recommender = StubRealPretrainedRecommender(allow_cold_start_fallback=True)
+        facade = PretrainedServiceFacade(recommender, allow_cold_start_fallback=True)
+
+        facade.record_user_interaction("new-user", "g2")
+        self.assertEqual([g.item_id for g in facade.get_user_played_games("new-user")], ["g2"])
+        results = facade.recommend_games("new-user", top_k=1)
+        self.assertEqual(results[0].game_id, "g0")
 
     def test_load_pretrained_factory(self):
         fake_module = type("FakeModule", (), {"PretrainedRecommender": StubRealPretrainedRecommender})
