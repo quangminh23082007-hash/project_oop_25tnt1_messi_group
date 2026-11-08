@@ -10,7 +10,7 @@ from src.contracts.exceptions import (
     EmptyDatasetError,
     InvalidParameterError,
 )
-from src.contracts.interfaces import BaseRecommender
+from src.contracts.interfaces import BaseRecommender, checked_indices
 
 
 def validate_id(value: str, name: str) -> str:
@@ -94,6 +94,51 @@ def validate_dataset(dataset: Any, role: str) -> None:
             or not callable(getattr(mapper, "to_raw", None))
         ):
             raise DataValidationError(f"{role}.{mapper_name} does not satisfy IdMapper.")
+        raw_ids = []
+        for index in range(int(mapper_size)):
+            try:
+                raw_id = mapper.to_raw(index)
+                round_trip = mapper.to_idx(raw_id)
+                contains = mapper.contains_raw(raw_id)
+            except Exception as exc:
+                raise DataValidationError(
+                    f"{role}.{mapper_name} cannot round-trip internal index {index}."
+                ) from exc
+            if not isinstance(raw_id, str) or not raw_id.strip() or round_trip != index or not contains:
+                raise DataValidationError(
+                    f"{role}.{mapper_name} has an invalid raw/internal ID order."
+                )
+            raw_ids.append(raw_id)
+        if len(set(raw_ids)) != len(raw_ids):
+            raise DataValidationError(f"{role}.{mapper_name} contains duplicate raw IDs.")
+
+    expected_seen = {(int(row.user_id), int(row.item_id)) for row in dataset.interactions}
+    expected_positive = {
+        (int(row.user_id), int(row.item_id))
+        for row in dataset.interactions
+        if float(row.rating) == 1.0
+    }
+    for user_id in range(dataset.num_users):
+        try:
+            seen = set(dataset.get_user_seen_items(user_id))
+            positive = set(dataset.get_user_positive_items(user_id))
+        except Exception as exc:
+            raise DataValidationError(f"{role} history access failed for user {user_id}.") from exc
+        try:
+            checked_seen_values = checked_indices(list(seen), dataset.num_items)
+            checked_positive_values = checked_indices(list(positive), dataset.num_items)
+            checked_seen = {(user_id, int(item_id)) for item_id in checked_seen_values}
+            checked_positive = {(user_id, int(item_id)) for item_id in checked_positive_values}
+        except Exception as exc:
+            raise DataValidationError(f"{role} history contains invalid item indices.") from exc
+        if not checked_positive.issubset(checked_seen):
+            raise DataValidationError(f"{role} positive history must be a subset of seen history.")
+        expected_user_seen = {pair for pair in expected_seen if pair[0] == user_id}
+        expected_user_positive = {pair for pair in expected_positive if pair[0] == user_id}
+        if checked_seen != expected_user_seen or checked_positive != expected_user_positive:
+            raise DataValidationError(
+                f"{role} history does not match its interaction records for user {user_id}."
+            )
 
     for name in ("mapping_fingerprint", "fingerprint", "review_fingerprint"):
         val = getattr(dataset, name)

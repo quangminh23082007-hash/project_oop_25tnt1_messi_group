@@ -15,6 +15,7 @@ from src.contracts.exceptions import (
 from src.service.pretrained import PretrainedDatasetProxy, PretrainedServiceFacade
 from src.service.recommendation_service import RecommendationService
 from tests.service.conftest import (
+    StubIdMapper,
     StubDataset,
     StubModel,
     StubPopularityRecommender,
@@ -193,6 +194,8 @@ class TestPretrained(unittest.TestCase):
             user_positive_items={0: {0}, 1: {2}, 2: set()},
             fallback_model=fallback,
             allow_cold_start_fallback=True,
+            mapping_fingerprint=self.data.mapping_fingerprint,
+            train_fingerprint=self.data.fingerprint,
         )
 
         baseline = facade.recommend_baseline("u0", top_k=1)
@@ -211,6 +214,8 @@ class TestPretrained(unittest.TestCase):
             user_positive_items={0: {0}, 1: {2}, 2: set()},
             fallback_model=self.fallback_model,
             allow_cold_start_fallback=True,
+            mapping_fingerprint=self.data.mapping_fingerprint,
+            train_fingerprint=self.data.fingerprint,
         )
 
         facade.record_user_interaction("new-user", "g0")
@@ -246,6 +251,8 @@ class TestPretrained(unittest.TestCase):
                 user_seen_items={0: {0, 1}, 1: {2}, 2: {3}},
                 fallback_model=StubPopularityRecommender(),
                 allow_cold_start_fallback=True,
+                mapping_fingerprint=self.data.mapping_fingerprint,
+                train_fingerprint=self.data.fingerprint,
             )
 
     def test_adapter_baseline_skips_missing_catalog_metadata(self):
@@ -262,9 +269,27 @@ class TestPretrained(unittest.TestCase):
             user_seen_items={0: set(), 1: set(), 2: set()},
             fallback_model=fallback,
             allow_cold_start_fallback=True,
+            mapping_fingerprint=self.data.mapping_fingerprint,
+            train_fingerprint=self.data.fingerprint,
         )
         results = facade.recommend_baseline(top_k=1, exclude_played=False)
         self.assertEqual(results[0].game_id, "g1")
+
+    def test_adapter_uses_train_dataset_mapper_order(self):
+        self.model.fit(self.data)
+        swapped_item_mapper = StubIdMapper(["g0", "g1", "g3", "g2", "g4"])
+        facade = PretrainedServiceFacade(
+            model=self.model,
+            user_mapper=self.data.user_mapper,
+            item_mapper=swapped_item_mapper,
+            catalog=self.data._games,
+            user_seen_items={0: {0, 1}, 1: {2}, 2: {3}},
+            user_positive_items={0: {0}, 1: {2}, 2: set()},
+            train_dataset=self.data,
+        )
+
+        results = facade.recommend_games("u0", top_k=1)
+        self.assertEqual(results[0].game_id, "g2")
 
     def test_pretrained_service_facade_cold_start_and_unknown_user(self):
         self.model.fit(self.data)
@@ -281,6 +306,8 @@ class TestPretrained(unittest.TestCase):
             user_positive_items=user_pos,
             fallback_model=self.fallback_model,
             allow_cold_start_fallback=False,
+            mapping_fingerprint=self.data.mapping_fingerprint,
+            train_fingerprint=self.data.fingerprint,
         )
 
         with self.assertRaises(UnknownUserError):

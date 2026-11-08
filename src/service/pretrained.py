@@ -206,9 +206,14 @@ class PretrainedServiceFacade:
                 raise InvalidParameterError("model must be an instance of BaseRecommender or PretrainedRecommender.")
             if not bool(getattr(model, "is_fitted", False)):
                 raise ModelNotFittedError(f"Model '{model.name}' must be fitted before initialization.")
-            if user_mapper is None or item_mapper is None or catalog is None or user_seen_items is None:
+            if (
+                catalog is None
+                or user_seen_items is None
+                or (train_dataset is None and (user_mapper is None or item_mapper is None))
+            ):
                 raise InvalidParameterError(
-                    "user_mapper, item_mapper, catalog, and user_seen_items are required for BaseRecommender adapter mode."
+                    "catalog and user_seen_items are required; user/item mappers are also required "
+                    "when train_dataset is not supplied."
                 )
 
             self._is_native = False
@@ -217,23 +222,45 @@ class PretrainedServiceFacade:
             self._fallback_model = fallback_model
             self._allow_cold_start_fallback = allow_cold_start_fallback
             self._source_dataset = train_dataset
-            self._user_mapper = user_mapper
-            self._item_mapper = item_mapper
+            self._validate_source_dataset_if_present()
+            if self._source_dataset is not None:
+                # The fitted train dataset owns the canonical raw<->internal
+                # order. Never trust a separately supplied mapper to replace it.
+                self._user_mapper = self._source_dataset.user_mapper
+                self._item_mapper = self._source_dataset.item_mapper
+            else:
+                self._user_mapper = user_mapper
+                self._item_mapper = item_mapper
             self._catalog = dict(catalog)
             self._mapping_fingerprint = mapping_fingerprint
             self._train_fingerprint = train_fingerprint
             self._validate_adapter_mappers()
-            self._user_seen_items = {u: set(items) for u, items in user_seen_items.items()}
-            self._user_positive_items = (
-                {u: set(items) for u, items in user_positive_items.items()}
-                if user_positive_items is not None
-                else {u: set(items) for u, items in user_seen_items.items()}
-            )
+            if self._source_dataset is None and not self._model_matches_adapter(self._model):
+                raise DataValidationError(
+                    "model dimensions/fingerprints do not match the adapter mapping metadata."
+                )
+            if self._source_dataset is not None:
+                # Histories must use the same internal IDs as the canonical
+                # train mapper, just like the model itself.
+                self._user_seen_items = {
+                    user_idx: set(self._source_dataset.get_user_seen_items(user_idx))
+                    for user_idx in range(self._source_dataset.num_users)
+                }
+                self._user_positive_items = {
+                    user_idx: set(self._source_dataset.get_user_positive_items(user_idx))
+                    for user_idx in range(self._source_dataset.num_users)
+                }
+            else:
+                self._user_seen_items = {u: set(items) for u, items in user_seen_items.items()}
+                self._user_positive_items = (
+                    {u: set(items) for u, items in user_positive_items.items()}
+                    if user_positive_items is not None
+                    else {u: set(items) for u, items in user_seen_items.items()}
+                )
             self._extra_seen: Dict[int, Set[int]] = defaultdict(set)
             self._extra_seen_raw = defaultdict(set)
             self._validate_adapter_histories()
 
-            self._validate_source_dataset_if_present()
             if self._source_dataset is not None and not model_matches_dataset(self._model, self._source_dataset):
                 raise DataValidationError(
                     "model dimensions/fingerprints do not match the provided train_dataset."
@@ -255,6 +282,10 @@ class PretrainedServiceFacade:
                 ):
                     raise DataValidationError(
                         "fallback_model dimensions/fingerprints do not match the provided train_dataset."
+                    )
+                elif self._source_dataset is None and not self._model_matches_adapter(fallback_model):
+                    raise DataValidationError(
+                        "fallback_model dimensions/fingerprints do not match the adapter mapping metadata."
                     )
             elif allow_cold_start_fallback:
                 raise ConfigurationError(
@@ -413,6 +444,30 @@ class PretrainedServiceFacade:
                 or not callable(getattr(mapper, "to_raw", None))
             ):
                 raise DataValidationError(f"{name} does not satisfy IdMapper.")
+            raw_ids = []
+            for index in range(int(size)):
+                try:
+                    raw_id = mapper.to_raw(index)
+                    round_trip = mapper.to_idx(raw_id)
+                    contains = mapper.contains_raw(raw_id)
+                except Exception as exc:
+                    raise DataValidationError(
+                        f"{name} cannot round-trip internal index {index}."
+                    ) from exc
+                if not isinstance(raw_id, str) or not raw_id.strip() or round_trip != index or not contains:
+                    raise DataValidationError(f"{name} has an invalid raw/internal ID order.")
+                raw_ids.append(raw_id)
+            if len(set(raw_ids)) != len(raw_ids):
+                raise DataValidationError(f"{name} contains duplicate raw IDs.")
+
+    def _model_matches_adapter(self, model: BaseRecommender) -> bool:
+        return (
+            bool(getattr(model, "is_fitted", False))
+            and getattr(model, "num_users", None) == self._user_mapper.size
+            and getattr(model, "num_items", None) == self._item_mapper.size
+            and getattr(model, "mapping_fingerprint", None) == self._mapping_fingerprint
+            and getattr(model, "train_fingerprint", None) == self._train_fingerprint
+        )
 
     def _validate_adapter_histories(self) -> None:
         for mapping_name, histories, limit in (

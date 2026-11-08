@@ -20,10 +20,16 @@ def to_recommendation_result(
         raise DataValidationError("scored must be a ScoredItem instance.")
     if not isinstance(game, GameItem):
         raise DataValidationError("game must be a GameItem instance.")
+    if isinstance(scored.item_idx, bool) or not isinstance(scored.item_idx, Integral) or scored.item_idx < 0:
+        raise DataValidationError("recommendation item_idx must be a non-negative integer.")
     if isinstance(rank, bool) or not isinstance(rank, Integral) or rank <= 0:
         raise DataValidationError("recommendation rank must be a positive integer.")
     if isinstance(scored.score, bool) or not isinstance(scored.score, Real) or not isfinite(scored.score):
         raise DataValidationError("recommendation score must be finite.")
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise DataValidationError("recommendation model_name must be a non-empty string.")
+    if not isinstance(is_fallback, bool):
+        raise DataValidationError("recommendation is_fallback must be boolean.")
     raw_genres = getattr(game, "genres", ()) or ()
     if isinstance(raw_genres, str):
         raw_genres = (raw_genres,)
