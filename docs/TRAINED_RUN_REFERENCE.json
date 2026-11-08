@@ -1,0 +1,219 @@
+{
+  "contract_revision": "1.1",
+  "delivery_mode": "pretrained-existing-run",
+  "data_branch_reference": {
+    "branch": "data",
+    "commit": "c70e4f4ff5fed932c14adfeea1ad58ca7d29907c",
+    "path": "src/data_layer.py",
+    "url": "https://github.com/quangminh23082007-hash/project_oop_25tnt1_messi_group/blob/c70e4f4ff5fed932c14adfeea1ad58ca7d29907c/src/data_layer.py"
+  },
+  "models": {
+    "bpr": {
+      "format_version": 3,
+      "representation": "compact",
+      "model_type": "BPRMatrixFactorization",
+      "config": {
+        "factors": 64,
+        "learning_rate": 0.001,
+        "reg": 0.01,
+        "epochs": 30,
+        "seed": 42,
+        "patience": 5
+      },
+      "data_fingerprint": "f7d21b3472caf85607f4d5e5fb9ec5530d757c415db7080451570af9ced8fa66",
+      "data_config": {
+        "split": "random",
+        "seed": 42,
+        "min_user": 3,
+        "min_item": 2,
+        "user_fraction": 1.0,
+        "allow_unverified_users": true,
+        "verified_user_ids": false,
+        "train_fraction": 0.7,
+        "validation_fraction": 0.15,
+        "train_end_ms": null,
+        "validation_end_ms": null
+      },
+      "data_limitations": [
+        "User identities are unverified and may be display names; collisions can invalidate personalized metrics.",
+        "Deterministic random pair split is exploratory; it does not establish future chronological generalization.",
+        "No eligible review text; train ordinary BPR until training-only text is supplied."
+      ],
+      "best_epoch": 18,
+      "feature_info": null,
+      "training_info": {
+        "backend": "pytorch-ddp",
+        "optimizer": "Adam",
+        "world_size": 2,
+        "batch_size": 1024,
+        "global_batch_size": 1024,
+        "max_batch_size_per_rank": 512,
+        "actual_device": "cuda:0",
+        "dtype": "float32",
+        "torch_version": "2.11.0+cu130",
+        "seed": 42,
+        "validation_rank": 0,
+        "objective": "mean BPR softplus plus per-triple L2",
+        "negative_policy": "uniform unseen TRAIN catalog item; all TRAIN observations excluded",
+        "reproducibility": "Same seeded triple stream; distributed floating point reductions may vary.",
+        "validation_k": 10,
+        "validation_max_users": 2000,
+        "validation_seed": 42
+      },
+      "weights_sha256": "b256a91bf9add04f427f871c152383c4f60903df00889d325c8b50ef071a9d29",
+      "num_users": 1394194,
+      "num_items": 23089,
+      "validation_report": {
+        "model": "bpr",
+        "best_epoch": 18,
+        "validation": {
+          "recall@10": 0.09029426316210223,
+          "ndcg@10": 0.05779440398903863,
+          "evaluated_users": 2000,
+          "eligible_users": 709758,
+          "candidate_catalog_size": 23089,
+          "candidate_policy": "all train items minus observed history"
+        },
+        "popularity_validation": {
+          "recall@10": 0.06051108005339922,
+          "ndcg@10": 0.036662110755724085,
+          "evaluated_users": 2000,
+          "eligible_users": 709758,
+          "candidate_catalog_size": 23089,
+          "candidate_policy": "all train items minus observed history"
+        }
+      }
+    },
+    "text_bpr": {
+      "format_version": 3,
+      "representation": "compact",
+      "model_type": "TextBPRMatrixFactorization",
+      "config": {
+        "factors": 64,
+        "learning_rate": 0.001,
+        "reg": 0.01,
+        "epochs": 30,
+        "seed": 42,
+        "patience": 5,
+        "text_reg": 0.001
+      },
+      "data_fingerprint": "f7d21b3472caf85607f4d5e5fb9ec5530d757c415db7080451570af9ced8fa66",
+      "data_config": {
+        "split": "random",
+        "seed": 42,
+        "min_user": 3,
+        "min_item": 2,
+        "user_fraction": 1.0,
+        "allow_unverified_users": true,
+        "verified_user_ids": false,
+        "train_fraction": 0.7,
+        "validation_fraction": 0.15,
+        "train_end_ms": null,
+        "validation_end_ms": null
+      },
+      "data_limitations": [
+        "User identities are unverified and may be display names; collisions can invalidate personalized metrics.",
+        "Deterministic random pair split is exploratory; it does not establish future chronological generalization."
+      ],
+      "best_epoch": 30,
+      "feature_info": {
+        "format_version": 1,
+        "data_fingerprint": "f7d21b3472caf85607f4d5e5fb9ec5530d757c415db7080451570af9ced8fa66",
+        "train_reviews_sha256": "741c9ea30556c4385927653e89806cd2a1dff0732717df3281004cb39b3e1af5",
+        "features_sha256": "5031f97029d746bfcbfccee192dce289aa9d3a49cc39b6cb5409042165076766",
+        "encoder": {
+          "model": "Qwen/Qwen3-Embedding-4B",
+          "requested_revision": null,
+          "resolved_revision": "5cf2132abc99cad020ac570b19d031efec650f2b",
+          "dimension": 2560,
+          "native_dimension": 2560,
+          "max_tokens": 256,
+          "pooling": "published SentenceTransformer modules; last-token pooling",
+          "modules_sha256": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+          "pooling_config_sha256": "0f0ed3380602b252fced3fab6d07c76752c32ffca818ccc61afaf17ae8edd96f",
+          "prompt": "",
+          "input_role": "review document",
+          "normalization": "truncate dimensions, cast float32, L2-normalize",
+          "padding_side": "left",
+          "attention_implementation": "sdpa",
+          "frozen": true,
+          "device": [
+            "cuda:0",
+            "cuda:1"
+          ],
+          "dtype": "torch.float16",
+          "torch_version": "2.11.0+cu130",
+          "transformers_version": "4.57.6",
+          "sentence_transformers_version": "5.7.0",
+          "devices": [
+            "cuda:0",
+            "cuda:1"
+          ],
+          "strategy": "independent spawned encoder replicas",
+          "per_device_batch_size": 2,
+          "chunk_size": 64,
+          "dispatch_size": 128,
+          "worker_timeout_seconds": 600.0,
+          "worker_review_counts": [
+            46203,
+            46144
+          ]
+        },
+        "aggregation": "L2-normalized mean of normalized review vectors",
+        "selection": "first N per item in prepared train_reviews.jsonl order",
+        "max_reviews_per_item": 4,
+        "batch_size": 2,
+        "dispatch_size": 128,
+        "train_reviews_available": 11260232,
+        "reviews_encoded": 92347,
+        "reviews_skipped_by_cap": 11167885,
+        "items_with_text": 23089,
+        "items_with_zero_features": 0,
+        "n_items": 23089,
+        "dimension": 2560,
+        "dtype": "float32",
+        "feature_build_seconds": 3596.7293570209986
+      },
+      "training_info": {
+        "backend": "pytorch",
+        "optimizer": "Adam",
+        "batch_size": 1024,
+        "requested_device": "cuda:0",
+        "actual_device": "cuda:0",
+        "dtype": "float32",
+        "torch_version": "2.11.0+cu130",
+        "objective": "mean BPR softplus plus per-triple L2 and shared text projection L2",
+        "negative_policy": "uniform unseen TRAIN catalog item; all TRAIN observations excluded",
+        "seed": 42,
+        "reproducibility": "Seeded sampling; CUDA kernels may vary across hardware/software.",
+        "validation_k": 10,
+        "validation_max_users": 2000,
+        "validation_seed": 42
+      },
+      "weights_sha256": "d9b7d86bcde3024fe2fa298885ae07b4affaa67bc3b1b9f63f2d399c46b4a28c",
+      "num_users": 1394194,
+      "num_items": 23089,
+      "validation_report": {
+        "model": "text-bpr",
+        "best_epoch": 30,
+        "validation": {
+          "recall@10": 0.09488625535291857,
+          "ndcg@10": 0.05561385771797365,
+          "evaluated_users": 2000,
+          "eligible_users": 709758,
+          "candidate_catalog_size": 23089,
+          "candidate_policy": "all train items minus observed history"
+        },
+        "popularity_validation": {
+          "recall@10": 0.06051108005339922,
+          "ndcg@10": 0.036662110755724085,
+          "evaluated_users": 2000,
+          "eligible_users": 709758,
+          "candidate_catalog_size": 23089,
+          "candidate_policy": "all train items minus observed history"
+        }
+      }
+    }
+  },
+  "note": "Recorded provenance of existing exports, not a new training run. Current GitHub Data code is the integration reference; identical source data/reproducibility is not inferred from matching ratios."
+}

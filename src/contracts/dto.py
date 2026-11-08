@@ -1,98 +1,201 @@
-"""
-Immutable Data Transfer Objects (DTOs) shared across all 4 architectural layers.
-
-Design Justifications:
-- Immutability via `@dataclass(frozen=True)`: Prevents unintended side effects and state
-  mutation when transferring records across layer boundaries (Encapsulation).
-- Defensive Validation in `__post_init__`: Guarantees that any invalid record, configuration,
-  or result is rejected immediately at creation time rather than causing subtle failures later.
-"""
+"""Shared records from Contracts v1 (2026-11-05), defined only here."""
+from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
-from src.contracts.exceptions import ConfigurationError, DataValidationError
+from math import isfinite
+from numbers import Integral, Real
+from typing import Any
+import numpy as np
+from .exceptions import ConfigurationError, DataValidationError
+
+
+def _index(value, name):
+    if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+        raise DataValidationError(f"{name} must be a nonnegative integer")
+
+
+def _label(value):
+    if isinstance(value, bool) or not isinstance(value, Real) or value not in (0.0, 1.0):
+        raise DataValidationError("rating must be numeric 0.0 or 1.0")
 
 
 @dataclass(frozen=True)
 class InteractionRecord:
-    """Raw interaction record loaded from source files before integer indexing."""
-
     user_id: str
     item_id: str
     rating: float
     timestamp: int = 0
 
-    def __post_init__(self) -> None:
-        if not self.user_id or not isinstance(self.user_id, str) or not self.user_id.strip():
-            raise DataValidationError("user_id must be a non-empty string.")
-        if not self.item_id or not isinstance(self.item_id, str) or not self.item_id.strip():
-            raise DataValidationError("item_id must be a non-empty string.")
-        try:
-            rating_val = float(self.rating)
-        except (ValueError, TypeError):
-            raise DataValidationError(f"rating must be numeric, got {self.rating!r}.")
-        if not (0.0 <= rating_val <= 5.0):
-            raise DataValidationError(f"rating must be in [0.0, 5.0], got {self.rating}.")
+    def __post_init__(self):
+        for name in ("user_id", "item_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise DataValidationError(f"{name} must be a nonempty raw ID")
+            object.__setattr__(self, name, value.strip())
+        _label(self.rating)
+        _index(self.timestamp, "timestamp")
+
+
+@dataclass(frozen=True)
+class Interaction:
+    user_id: int
+    item_id: int
+    rating: float
+    timestamp: int = 0
+
+    def __post_init__(self):
+        _index(self.user_id, "user_id")
+        _index(self.item_id, "item_id")
+        _label(self.rating)
+        _index(self.timestamp, "timestamp")
+
+
+@dataclass(frozen=True)
+class ReviewRecord:
+    user_id: int
+    item_id: int
+    rating: float
+    timestamp: int
+    text: str
+
+    def __post_init__(self):
+        Interaction(self.user_id, self.item_id, self.rating, self.timestamp)
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise DataValidationError("ReviewRecord.text must contain nonblank source text")
+
+
+@dataclass(frozen=True)
+class GameItem:
+    item_id: str
+    title: str
+    genres: tuple[str, ...] = ()
+    price: float | None = None
+    developer: str = "Unknown"
+
+    def __post_init__(self):
+        if not isinstance(self.item_id, str) or not self.item_id.strip():
+            raise DataValidationError("item_id must be a nonempty raw ID")
+        object.__setattr__(self, "item_id", self.item_id.strip())
+        if not isinstance(self.title, str) or not self.title.strip():
+            raise DataValidationError("title must be nonempty")
+        if not isinstance(self.genres, tuple) or any(not isinstance(g, str) for g in self.genres):
+            raise DataValidationError("genres must be a tuple of strings")
+        if self.price is not None and (isinstance(self.price, bool)
+                or not isinstance(self.price, Real) or not isfinite(self.price) or self.price < 0):
+            raise DataValidationError("price must be finite and nonnegative, or None")
 
 
 @dataclass(frozen=True)
 class ScoredItem:
-    """Internal model output pairing an internal item index with its predicted score."""
-
     item_idx: int
     score: float
 
 
 @dataclass(frozen=True)
 class RecommendationResult:
-    """User-facing recommendation item returned by the Service Layer to external clients."""
-
     rank: int
     game_id: str
     title: str
-    genres: Tuple[str, ...]
+    genres: tuple[str, ...]
     predicted_score: float
+    price: float | None = None
     developer: str = "Unknown"
-    price: Optional[float] = None
     model_name: str = ""
     is_fallback: bool = False
 
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """Validated configuration parameters for Recommendation Models."""
-
     n_factors: int = 16
     learning_rate: float = 0.01
     reg: float = 0.01
     n_epochs: int = 20
     random_seed: int = 42
+    patience: int = 5
+    text_reg: float = 0.001
 
-    def __post_init__(self) -> None:
-        if self.n_factors <= 0:
-            raise ConfigurationError(f"n_factors must be > 0, got {self.n_factors}.")
-        if self.learning_rate <= 0.0:
-            raise ConfigurationError(f"learning_rate must be > 0, got {self.learning_rate}.")
-        if self.reg < 0.0:
-            raise ConfigurationError(f"regularization must be >= 0, got {self.reg}.")
-        if self.n_epochs <= 0:
-            raise ConfigurationError(f"n_epochs must be > 0, got {self.n_epochs}.")
+    def __post_init__(self):
+        for name in ("n_factors", "n_epochs", "patience", "random_seed"):
+            value = getattr(self, name)
+            minimum = 0 if name == "random_seed" else 1
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < minimum:
+                raise ConfigurationError(f"{name} must be an integer >= {minimum}")
+        for name in ("learning_rate", "reg", "text_reg"):
+            value = getattr(self, name)
+            if (isinstance(value, bool) or not isinstance(value, Real) or not isfinite(value)
+                    or value < 0 or (name == "learning_rate" and value == 0)):
+                raise ConfigurationError(f"Invalid {name}: {value!r}")
 
 
 @dataclass(frozen=True)
-class EvaluationReport:
-    """Standardized evaluation output returned by Evaluator and Cornac Benchmark."""
+class ItemFeatures:
+    values: Any
+    item_ids: tuple[str, ...]
+    mapping_fingerprint: str
+    train_fingerprint: str
+    text_fingerprint: str
+    encoder_name: str
 
+    def __post_init__(self):
+        for name in ("mapping_fingerprint", "train_fingerprint", "text_fingerprint", "encoder_name"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name).strip():
+                raise ConfigurationError(f"ItemFeatures.{name} must be declared")
+        ids = tuple(self.item_ids)
+        if any(not isinstance(i, str) or not i.strip() for i in ids) or len(set(ids)) != len(ids):
+            raise DataValidationError("Feature item_ids must be unique raw string IDs")
+        try:
+            values = np.asarray(self.values)
+            if values.dtype.kind not in "fiu":
+                raise ValueError("values must be real numbers")
+            values = np.array(values, dtype=np.float64, copy=True)
+        except (ValueError, TypeError) as exc:
+            raise DataValidationError("Invalid feature matrix") from exc
+        if values.ndim != 2 or values.shape[0] != len(ids) or values.shape[1] == 0:
+            raise DataValidationError("Feature matrix must have shape (len(item_ids), dimension > 0)")
+        if not np.isfinite(values).all():
+            raise DataValidationError("Feature matrix must be finite")
+        norms = np.linalg.norm(values, axis=1)
+        if not np.all(np.isclose(norms, 0, atol=1e-6) | np.isclose(norms, 1, atol=1e-5)):
+            raise DataValidationError("Feature rows must have unit norm or be zero for missing text")
+        values.flags.writeable = False
+        object.__setattr__(self, "values", values)
+        object.__setattr__(self, "item_ids", ids)
+
+
+@dataclass(frozen=True)
+class DatasetSplits:
+    train: Any
+    validation: Any
+    test: Any
+    report: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class UserEvaluation:
+    user_id: int
+    metrics: dict[str, float]
+    recommended_items: tuple[int, ...]
+    relevant_items: frozenset[int]
+    candidate_count: int
+
+
+@dataclass(frozen=True)
+class SkippedUser:
+    user_id: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class EvaluationResult:
     model_name: str
-    metrics: Dict[str, float] = field(default_factory=dict)
-    num_evaluated_users: int = 0
-    notes: Optional[str] = None
+    split_name: str
+    metrics: dict[str, float] = field(default_factory=dict)
+    per_user: tuple[UserEvaluation, ...] = ()
+    skipped_users: tuple[SkippedUser, ...] = ()
+    fit_seconds: float = 0.0
+    evaluate_seconds: float = 0.0
 
 
-__all__ = [
-    "InteractionRecord",
-    "ScoredItem",
-    "RecommendationResult",
-    "ModelConfig",
-    "EvaluationReport",
-]
+__all__ = ["InteractionRecord", "Interaction", "ReviewRecord", "GameItem", "ScoredItem",
+           "RecommendationResult", "ModelConfig", "ItemFeatures", "DatasetSplits",
+           "EvaluationResult", "UserEvaluation", "SkippedUser"]
