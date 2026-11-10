@@ -106,6 +106,16 @@ def create_demo_service() -> RecommendationService:
         4: set(),        # cold-start: không có tương tác tích cực
     }
 
+    interactions = [
+        Interaction(
+            user_id=user_id,
+            item_id=item_id,
+            rating=1.0 if item_id in user_pos.get(user_id, set()) else 0.0,
+        )
+        for user_id, seen_items in user_seen.items()
+        for item_id in sorted(seen_items)
+    ]
+
     dataset = PretrainedDatasetProxy(
         user_mapper=user_mapper,
         item_mapper=item_mapper,
@@ -114,6 +124,7 @@ def create_demo_service() -> RecommendationService:
         user_positive_items=user_pos,
         mapping_fingerprint="demo-mfp",
         fingerprint="demo-train-fp",
+        interactions=interactions,
     )
 
     model = DemoRecommender()
