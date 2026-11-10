@@ -1,0 +1,12 @@
+{
+  "run_name": "evaluation_pretrained",
+  "model": "bpr",
+  "model_dir": "artifacts/models/bpr/cpu",
+  "reference_path": "docs/TRAINED_RUN_REFERENCE.json",
+  "user_ids": ["!"],
+  "top_k": 10,
+  "exclude_played": true,
+  "allow_cold_start_fallback": false,
+  "extra_seen": [],
+  "output_dir": "results"
+}
