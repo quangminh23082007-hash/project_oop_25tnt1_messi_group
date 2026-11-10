@@ -5,7 +5,12 @@ from src.contracts.exceptions import (
     UnknownItemError,
     UnknownUserError,
 )
-from src.ui.bootstrap import get_service, create_demo_service
+from src.ui.bootstrap import (
+    SERVICE_MODES,
+    create_demo_service,
+    default_service_mode,
+    get_service,
+)
 from src.ui.components.error_handler import handle_ui_error
 from src.ui.components.game_card import get_steam_poster_url
 from src.ui.data import game_id_options, genre_options, user_id_options
@@ -16,6 +21,22 @@ def test_bootstrap_service_contract():
     assert service.is_ready
     assert service.model_name != ""
     assert service.allow_cold_start_fallback is True
+
+
+def test_mode_aware_bootstrap_defaults_to_demo(monkeypatch):
+    monkeypatch.delenv("RECSYS_MODE", raising=False)
+    assert SERVICE_MODES == ("demo", "bpr", "text-bpr")
+    assert default_service_mode() == "demo"
+
+    service = get_service("demo")
+    assert service.mode == "demo"
+    assert service.is_ready
+    assert service.supports_catalog_filters is True
+
+
+def test_invalid_environment_mode_falls_back_to_demo(monkeypatch):
+    monkeypatch.setenv("RECSYS_MODE", "not-a-model")
+    assert default_service_mode() == "demo"
 
 
 def test_ui_dynamic_data_discovery():

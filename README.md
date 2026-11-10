@@ -21,7 +21,25 @@ py -3.10 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-evaluation.txt
 ```
 
-Trên Linux hoặc macOS, dùng trình thông dịch `.venv/bin/python` tương ứng. Để chạy Data với Parquet, cài thêm nhóm phụ thuộc `data` của [`pyproject.toml`](pyproject.toml). Cấu hình đóng gói hiện tại bao gồm Model và contracts. Các lệnh benchmark bên dưới chạy từ mã nguồn trong repo.
+Trên Linux hoặc macOS, dùng trình thông dịch `.venv/bin/python` tương ứng. Để chạy Data với Parquet, cài thêm nhóm phụ thuộc `data` của [`pyproject.toml`](pyproject.toml). Cấu hình đóng gói bao gồm toàn bộ các tầng trong `src`. Các lệnh benchmark bên dưới chạy từ mã nguồn trong repo.
+
+## Chạy giao diện
+
+Cài nhóm phụ thuộc UI rồi khởi động Streamlit:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[ui]"
+.\.venv\Scripts\python.exe -m streamlit run src/ui/app.py
+```
+
+Trong thanh bên, chọn **Demo**, **Dataset thật - BPR** hoặc **Dataset thật - TextBPR**.
+Chế độ BPR/TextBPR chỉ xuất hiện sau khi giao diện mở nhưng cần bundle tương ứng tại
+`artifacts/models/bpr/cpu` hoặc `artifacts/models/text_bpr/cpu`. Khi thiếu bundle,
+giao diện sẽ báo chính xác file cần cài. Có thể đặt chế độ mặc định trước khi chạy:
+
+```powershell
+$env:RECSYS_MODE="bpr"
+```
 
 ## Dùng BPR và TextBPR đã train
 

@@ -1,13 +1,13 @@
 import streamlit as st
 
-from src.service.recommendation_service import RecommendationService
 from src.ui.components.error_handler import handle_ui_error
 from src.ui.components.game_card import render_game_card
 from src.ui.data import game_id_options
+from src.ui.service_protocol import UIRecommendationService
 
 
 @handle_ui_error
-def render_game_catalog_view(service: RecommendationService) -> None:
+def render_game_catalog_view(service: UIRecommendationService) -> None:
     st.subheader("Tra cứu game catalog")
 
     col_input, col_btn = st.columns([3, 1])

@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import importlib
 import os
-from typing import Optional
 import numpy as np
 import streamlit as st
 
 from src.contracts.dto import GameItem, Interaction
 from src.contracts.interfaces import BaseRecommender
-from src.service.pretrained import PretrainedDatasetProxy, PretrainedServiceFacade
+from src.service.pretrained import PretrainedDatasetProxy
 from src.service.recommendation_service import RecommendationService
+from src.ui.service_adapter import UIServiceAdapter
+from src.ui.service_protocol import UIRecommendationService
 
 
 class DemoMapper:
@@ -139,44 +139,32 @@ def create_demo_service() -> RecommendationService:
     return svc
 
 
+SERVICE_MODES = ("demo", "bpr", "text-bpr")
+
+
+def default_service_mode() -> str:
+    configured = os.getenv("RECSYS_MODE", "demo").strip().lower()
+    return configured if configured in SERVICE_MODES else "demo"
+
+
 @st.cache_resource(show_spinner="Đang khởi tạo hệ thống đề xuất...")
-def get_service() -> RecommendationService:
-    """Return the configured service, with the demo only as a local fallback.
+def get_service(mode: str = "demo") -> UIRecommendationService:
+    """Return the UI service for the selected demo or pretrained mode."""
+    normalized = str(mode).strip().lower()
+    if normalized == "demo":
+        return UIServiceAdapter(
+            create_demo_service(),
+            mode="demo",
+            supports_catalog_filters=True,
+        )
+    if normalized in ("bpr", "text-bpr"):
+        from src.integration import create_real_service
 
-    Set ``RECSYS_SERVICE_FACTORY=package.module:function`` to connect the real
-    Data, Model and Evaluation layers without changing the UI.
-    """
-    factory_path = os.getenv("RECSYS_SERVICE_FACTORY", "").strip()
-    if not factory_path:
-        for candidate in (
-            "src.integration:create_service",
-            "src.app_factory:create_service",
-            "src.data.integration:create_service",
-        ):
-            try:
-                module_name, function_name = candidate.rsplit(":", 1)
-                getattr(importlib.import_module(module_name), function_name)
-                factory_path = candidate
-                break
-            except (ImportError, AttributeError):
-                continue
-    if factory_path:
-        try:
-            module_name, function_name = factory_path.rsplit(":", 1)
-            factory = getattr(importlib.import_module(module_name), function_name)
-            service = factory()
-            if not isinstance(service, RecommendationService):
-                raise TypeError("Configured factory must return RecommendationService.")
-            return service
-        except (ImportError, AttributeError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f"Cannot load RECSYS_SERVICE_FACTORY={factory_path!r}: {exc}"
-            ) from exc
-
-    return create_demo_service()
+        return create_real_service(normalized)
+    raise ValueError(f"Unknown service mode: {mode!r}")
 
 
-def get_sample_user_ids(service: RecommendationService, max_samples: int = 10) -> list[str]:
+def get_sample_user_ids(service: UIRecommendationService, max_samples: int = 10) -> list[str]:
     try:
         dataset = service.dataset
         user_mapper = getattr(dataset, "user_mapper", None)
@@ -190,7 +178,7 @@ def get_sample_user_ids(service: RecommendationService, max_samples: int = 10) -
     return ["steam_user_101", "steam_user_102", "steam_user_103", "steam_user_104", "steam_user_cold"]
 
 
-def get_available_genres(service: RecommendationService) -> list[str]:
+def get_available_genres(service: UIRecommendationService) -> list[str]:
     genres_set: set[str] = set()
     try:
         dataset = service.dataset
@@ -210,7 +198,7 @@ def get_available_genres(service: RecommendationService) -> list[str]:
     return ["Tất cả"] + sorted(genres_set)
 
 
-def get_sample_games(service: RecommendationService, max_samples: int = 15) -> list[tuple[str, str]]:
+def get_sample_games(service: UIRecommendationService, max_samples: int = 15) -> list[tuple[str, str]]:
     games: list[tuple[str, str]] = []
     try:
         dataset = service.dataset
