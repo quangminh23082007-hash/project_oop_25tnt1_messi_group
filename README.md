@@ -39,8 +39,17 @@ Hai bundle CPU được phát hành riêng với mã nguồn. Tải [BPR và Tex
 
 Benchmark nạp BPR và TextBPR đã train, fit `cornac.models.MostPop` trên các cặp tích cực của tập train gốc và chấm cả ba mô hình trên cùng người dùng, lịch sử và tập ứng viên. Các độ đo là Recall@5, Recall@10, NDCG@5 và NDCG@10.
 
-Đặt hai bundle vào `artifacts/models/bpr/cpu/` và `artifacts/models/text_bpr/cpu/`. Đặt bốn file prepared gốc (`dataset.npz`, `mappings.json`, `report.json`, `catalog.json`) vào `artifacts/prepared_original/`. Runner đối chiếu fingerprint và thứ tự ID của dữ liệu với bundle. Có thể đổi các đường dẫn trong [`configs/benchmark.json`](configs/benchmark.json).
+Cài hai bundle BPR và TextBPR theo mục **Dùng BPR và TextBPR đã train** ở trên.
 
+Tải [`prepared_original.zip`](https://github.com/quangminh23082007-hash/project_oop_25tnt1_messi_group/releases/download/pretrained-legacy-v1/prepared_original.zip) từ GitHub Release bằng tài khoản có quyền đọc repo. Lưu ZIP vào `Downloads`, rồi chạy lệnh sau từ thư mục gốc của repo:
+
+```powershell
+Expand-Archive -LiteralPath "$env:USERPROFILE\Downloads\prepared_original.zip" -DestinationPath .\artifacts
+```
+
+ZIP đã chứa thư mục `prepared_original`. Sau khi giải nén, kiểm tra `dataset.npz`, `mappings.json`, `report.json` và `catalog.json` nằm trực tiếp trong `artifacts/prepared_original/`.
+
+Benchmark kiểm tra dấu vân tay dữ liệu và thứ tự ID để bảo đảm bộ dữ liệu khớp với hai checkpoint. Với cấu trúc trên, có thể dùng trực tiếp `configs/benchmark.json`.
 Chạy thử 100 người dùng của tập test.
 
 ```powershell
