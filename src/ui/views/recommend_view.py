@@ -43,7 +43,7 @@ def render_recommend_view(service: UIRecommendationService) -> None:
             step=5.0,
             disabled=not catalog_filters,
         )
-        max_price = max_price_input if max_price_input > 0.0 else None
+        max_price = max_price_input if catalog_filters and max_price_input > 0.0 else None
         if not catalog_filters:
             st.caption("Bundle pretrained chưa có metadata giá/thể loại đã xác minh nên hai bộ lọc này được tắt.")
 
