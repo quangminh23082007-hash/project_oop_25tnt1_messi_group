@@ -1,13 +1,13 @@
 import streamlit as st
 
-from src.service.recommendation_service import RecommendationService
 from src.ui.components.error_handler import handle_ui_error
 from src.ui.components.game_card import render_recommendation_card
 from src.ui.data import genre_options, user_id_options
+from src.ui.service_protocol import UIRecommendationService
 
 
 @handle_ui_error
-def render_recommend_view(service: RecommendationService) -> None:
+def render_recommend_view(service: UIRecommendationService) -> None:
     st.subheader("Đề xuất game")
 
     col_ctrl, col_results = st.columns([1, 2], gap="large")
@@ -27,12 +27,25 @@ def render_recommend_view(service: RecommendationService) -> None:
         top_k = st.slider("Top K", min_value=1, max_value=20, value=5)
         exclude_played = st.checkbox("Loại bỏ game đã chơi", value=True)
 
-        available_genres = genre_options(service)
-        selected_genre = st.selectbox("Thể loại", options=["Tất cả", *available_genres])
+        catalog_filters = service.supports_catalog_filters
+        available_genres = genre_options(service) if catalog_filters else []
+        selected_genre = st.selectbox(
+            "Thể loại",
+            options=["Tất cả", *available_genres],
+            disabled=not catalog_filters,
+        )
         genre_filter = None if selected_genre == "Tất cả" else selected_genre
 
-        max_price_input = st.number_input("Giá tối đa (USD)", min_value=0.0, value=0.0, step=5.0)
-        max_price = max_price_input if max_price_input > 0.0 else None
+        max_price_input = st.number_input(
+            "Giá tối đa (USD)",
+            min_value=0.0,
+            value=0.0,
+            step=5.0,
+            disabled=not catalog_filters,
+        )
+        max_price = max_price_input if catalog_filters and max_price_input > 0.0 else None
+        if not catalog_filters:
+            st.caption("Bundle pretrained chưa có metadata giá/thể loại đã xác minh nên hai bộ lọc này được tắt.")
 
         submit = st.button("Lấy đề xuất", use_container_width=True, type="primary")
 

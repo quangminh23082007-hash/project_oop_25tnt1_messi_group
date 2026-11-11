@@ -7,18 +7,33 @@ from typing import Any
 
 import streamlit as st
 
-from src.service.recommendation_service import RecommendationService
 from src.ui.components.error_handler import handle_ui_error
 from src.ui.components.game_card import render_recommendation_card
 from src.ui.components.metric_table import render_metric_table
 from src.ui.data import user_id_options
+from src.ui.service_protocol import UIRecommendationService
 
 
 def _summary_path() -> Path:
     configured = os.getenv("RECSYS_BENCHMARK_SUMMARY", "").strip()
     if configured:
         return Path(configured)
-    return Path(__file__).resolve().parents[3] / "results" / "summary.csv"
+    project_root = Path(__file__).resolve().parents[3]
+    benchmark_summary = project_root / "results" / "benchmark" / "summary.csv"
+    if benchmark_summary.is_file():
+        return benchmark_summary
+    candidates = sorted(
+        (
+            path
+            for path in (project_root / "results" / "benchmark").glob("*/summary.csv")
+            if path.is_file()
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if candidates:
+        return candidates[0]
+    return project_root / "results" / "summary.csv"
 
 
 def _load_summary() -> list[dict[str, Any]]:
@@ -55,7 +70,7 @@ def _metric_key(rows: list[dict[str, Any]], target: str) -> str | None:
 
 
 @handle_ui_error
-def render_benchmark_view(service: RecommendationService) -> None:
+def render_benchmark_view(service: UIRecommendationService) -> None:
     st.subheader("Quản lý mô hình và đối chuẩn")
 
     st.markdown('<div class="section-label">Thao tác nhanh trên Service</div>', unsafe_allow_html=True)
